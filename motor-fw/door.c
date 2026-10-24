@@ -18,6 +18,7 @@
 #include <math.h>
 #include "cybsp.h"
 #include "Controller.h"
+#include "MotorLibAPI.h"
 #include "door.h"
 
 #define DOOR_I_LIMIT            (3.0f)    /* [A] hard cap, below the DB42M03 rated 3.47 A */
@@ -32,6 +33,7 @@
 #define DOOR_RAMP_DOWN_A_PER_MS (0.02f)
 #define DOOR_CPS_WINDOW_MS      (100U)
 #define DOOR_TICK_HZ            (10000U)  /* SysTick rate: Hall sampling and the ms clock */
+#define DOOR_FAULT_RETRY_MS     (2000U)   /* with an external command source the library never clears faults itself */
 
 DOOR_t door =
 {
@@ -57,6 +59,8 @@ static int32_t pos_window_start = 0;
 static uint32_t window_start_ms = 0U;
 static uint32_t ms_prev = 0U;
 static uint32_t ticks_in_ms = 0U;
+static bool fault_mask_set = false;
+static uint32_t last_fault_clear_ms = 0U;
 
 static uint32_t ReadHall(void)
 {
@@ -203,9 +207,34 @@ static void Control(uint32_t now_ms)
 
     CTRL_VARS_t *vars_ptr = motor[0].vars_ptr;
     float i_max = motor[0].params_ptr->sys.cmd.i_max;
+
+    /* Holding torque at standstill leaves one phase near zero current for as long as
+     * the rotor sits at that angle, which the phase-loss check reads as a broken wire
+     * and latches a fault. Ignore it; over-current and the other checks stay active.
+     * Must run after the library's first init, which installs the default masks. */
+    if (!fault_mask_set && motor[0].sm_ptr->vars.init.param_init_done)
+    {
+        MOTOR_CTRL_SetFaultReactMask(&motor[0], No_Reaction, (FAULT_FLAGS_t){ .sw.phase_loss = 1 });
+        fault_mask_set = true;
+    }
+    if ((door.state != DOOR_DISARMED) && (motor[0].sm_ptr->current == Fault) &&
+        ((now_ms - last_fault_clear_ms) >= DOOR_FAULT_RETRY_MS))
+    {
+        vars_ptr->clr_faults = true;
+        last_fault_clear_ms = now_ms;
+    }
     float wind_sign = (door.wind_sign >= 0) ? +1.0f : -1.0f;
     vars_ptr->cmd_ext = (i_max > 0.0f) ? Clamp(wind_sign * door.i_cmd / i_max, -1.0f, 1.0f) : 0.0f;
     vars_ptr->en = (door.state != DOOR_DISARMED);
+
+    /* What the motor actually does, to check the commanded current really flows */
+    STATE_ID_t lib_state = motor[0].sm_ptr->current;
+    door.iq_fb = vars_ptr->i_qd_r_fb.q;
+    door.iq_ref = vars_ptr->i_qd_r_cmd.q;
+    door.vdc = vars_ptr->v_dc;
+    door.lib_state = (uint32_t)lib_state;
+    door.lib_flags = ((lib_state == Current_CL) ? 1U : 0U) | ((lib_state == Fault) ? 2U : 0U);
+    door.fault_sw = motor[0].faults_ptr->flags_latched.sw.reg;
 }
 
 /* Lowest priority, so it never delays the motor control ISRs, but it still

@@ -6,3 +6,5 @@ mtb_shared/
 __pycache__/
 
 .DS_Store
+host/logs/
+host/control.json

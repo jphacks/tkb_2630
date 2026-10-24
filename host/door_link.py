@@ -10,12 +10,15 @@ the same way Infineon's Motor Suite GUI talks to the board.
 """
 
 import argparse
+import csv
+import json
 import os
 import struct
 import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, fields
 
 import pylink
@@ -27,6 +30,8 @@ DEFAULT_ELF = os.path.join(
 )
 NM = os.path.expanduser("~/Applications/mtb-gcc-arm-eabi/14.2.1/gcc/bin/arm-none-eabi-nm")
 JLINK_DEVICE = "PSC3xxF"  # attach without reset; the _tm variant resets into test mode
+CONTROL_FILE = os.path.join(HERE, "control.json")  # e.g. {"level": 0.5}; read by `run` when it changes
+LOG_DIR = os.path.join(HERE, "logs")
 
 STATE_NAMES = {0: "DISARMED", 1: "IDLE", 2: "RESIST", 3: "COOLDOWN"}
 
@@ -48,9 +53,23 @@ class Door:
     hall_errors: int
     state: int
     i_cmd: float
+    iq_fb: float
+    iq_ref: float
+    vdc: float
+    lib_state: int
+    lib_flags: int
+    fault_sw: int
 
 
-FORMAT = "<IIfffiiIifIIIf"
+FORMAT = "<IIfffiiIifIIIffffIII"
+
+# Bit order of FAULT_FLAGS_t.sw in motor-ctrl-lib (CTRL_METHOD_RFO)
+FAULT_NAMES = ["oc", "ot_ps", "ov_vdc", "uv_vdc", "os", "hall", "params", "brk", "em_stop",
+               "encoder", "phase_loss", "offset_oor", "flux", "stall_detection", "profiler"]
+
+
+def fault_names(bits):
+    return ",".join(n for i, n in enumerate(FAULT_NAMES) if bits >> i & 1)
 WORDS = struct.calcsize(FORMAT) // 4
 OFFSET = {f.name: 4 * i for i, f in enumerate(fields(Door))}
 FIELD_FMT = dict(zip(OFFSET, FORMAT[1:]))
@@ -112,7 +131,10 @@ def fmt(d):
     return (
         f"t={d.fw_ms/1000:8.2f}s  {STATE_NAMES.get(d.state, d.state):9s} "
         f"hall={d.hall_uvw:03b} pos={d.pos:6d} ({d.pos/24:+6.2f} rev) "
-        f"cps={d.cps:+7.1f} i={d.i_cmd:4.2f}A lv={d.level:.2f} err={d.hall_errors}"
+        f"cps={d.cps:+7.1f} i={d.i_cmd:4.2f}A iq={d.iq_fb:+5.2f}A "
+        f"{'CL' if d.lib_flags & 1 else ('FAULT' if d.lib_flags & 2 else f'lib{d.lib_state}')} "
+        f"lv={d.level:.2f} err={d.hall_errors}"
+        + (f" faults=[{fault_names(d.fault_sw)}]" if d.fault_sw else "")
     )
 
 
@@ -148,35 +170,84 @@ def calibrate(link, args):
     print(f"-> with --wind-sign 1, use --open-dir {-wind_dir}")
 
 
+def clamp(x, lo, hi):
+    return min(max(x, lo), hi)
+
+
+LIMITS = {"level": 1.0, "i_take": 3.0, "i_max": 3.0}
+
+
 def run(link, args):
-    link.write(
-        armed=0, level=args.level, i_take=args.i_take, i_resist_max=args.i_max,
-        open_dir=args.open_dir, wind_sign=args.wind_sign,
-    )
+    settings = {"level": args.level, "i_take": args.i_take, "i_max": args.i_max}
+
+    def apply(**changes):
+        for key, value in changes.items():
+            settings[key] = clamp(float(value), 0.0, LIMITS[key])
+        link.write(level=settings["level"], i_take=settings["i_take"], i_resist_max=settings["i_max"])
+        print(f"-> level={settings['level']:.2f} i_take={settings['i_take']:.2f}A i_max={settings['i_max']:.2f}A")
+
+    link.write(armed=0, open_dir=args.open_dir, wind_sign=args.wind_sign)
+    apply()
     link.start_heartbeat()
     link.write(armed=1)
-    print(f"armed: level={args.level} i_take={args.i_take}A i_max={args.i_max}A")
-    print("type a level 0-1 and Enter to change it live; q or Ctrl+C to disarm")
+    print("armed. Type 0.3 + Enter for a level, 'max 2' / 'take 0.3' for currents, q to stop.")
+    print(f"(with a Japanese IME on, Enter only confirms the text: press it twice) or edit {CONTROL_FILE}")
 
     stop = threading.Event()
 
-    def read_levels():
+    def read_commands():
         for line in sys.stdin:
-            text = line.strip()
-            if text == "q":
+            words = unicodedata.normalize("NFKC", line).strip().lower().split()
+            if words == ["q"]:
                 break
             try:
-                level = min(max(float(text), 0.0), 1.0)
+                if len(words) == 1:
+                    apply(level=words[0])
+                elif len(words) == 2 and words[0] in ("max", "take"):
+                    apply(**{"i_" + words[0]: words[1]})
+                elif words:
+                    print("? type 0-1 for a level, 'max 2', 'take 0.3' or q")
             except ValueError:
-                continue
-            link.write(level=level)
-            print(f"level -> {level}")
+                print("? type 0-1 for a level, 'max 2', 'take 0.3' or q")
         stop.set()
 
-    threading.Thread(target=read_levels, daemon=True).start()
-    while not stop.is_set():
-        print(fmt(link.read()))
-        time.sleep(0.2)
+    threading.Thread(target=read_commands, daemon=True).start()
+
+    def control_mtime():
+        try:
+            return os.path.getmtime(CONTROL_FILE)
+        except OSError:
+            return None
+
+    seen_mtime = control_mtime()  # ignore whatever an earlier run left there
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log_path = os.path.join(LOG_DIR, time.strftime("run-%Y%m%d-%H%M%S.csv"))
+    with open(log_path, "w", newline="") as f:
+        log = csv.writer(f)
+        log.writerow(["wall_s", "fw_ms", "state", "pos", "cps", "i_cmd", "level",
+                      "iq_fb", "iq_ref", "vdc", "lib_state", "lib_flags", "faults"])
+        n = 0
+        while not stop.is_set():
+            d = link.read()
+            log.writerow([f"{time.time():.3f}", d.fw_ms, STATE_NAMES.get(d.state, d.state),
+                          d.pos, f"{d.cps:.1f}", f"{d.i_cmd:.3f}", f"{d.level:.2f}",
+                          f"{d.iq_fb:.3f}", f"{d.iq_ref:.3f}", f"{d.vdc:.2f}", d.lib_state, d.lib_flags,
+                          fault_names(d.fault_sw)])
+            if n % 4 == 0:
+                print(fmt(d))
+            n += 1
+
+            mtime = control_mtime()
+            if mtime is not None and mtime != seen_mtime:
+                seen_mtime = mtime
+                try:
+                    with open(CONTROL_FILE) as cf:
+                        data = json.load(cf)
+                    apply(**{k: v for k, v in data.items() if k in settings})
+                except (OSError, ValueError) as e:
+                    print(f"? {CONTROL_FILE}: {e}")
+            time.sleep(0.05)
+    print(f"log: {log_path}")
 
 
 def main():

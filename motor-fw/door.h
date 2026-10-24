@@ -40,6 +40,12 @@ typedef struct
     volatile uint32_t hall_errors;  /* invalid codes or skipped sectors */
     volatile uint32_t state;        /* DOOR_STATE_t */
     volatile float i_cmd;           /* [A] current being commanded */
+    volatile float iq_fb;           /* [A] measured torque-producing current, signed */
+    volatile float iq_ref;          /* [A] the library's own q-axis command after its limits */
+    volatile float vdc;             /* [V] DC bus voltage */
+    volatile uint32_t lib_state;    /* raw STATE_ID_t of the motor control library */
+    volatile uint32_t lib_flags;    /* bit0: in Current_CL, bit1: in Fault */
+    volatile uint32_t fault_sw;     /* latched software fault bits of the library (FAULT_FLAGS_t.sw) */
 } DOOR_t;
 
 extern DOOR_t door;
