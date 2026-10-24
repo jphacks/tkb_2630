@@ -54,7 +54,7 @@ extern  TEMP_SENS_LUT_t     Temp_Sens_LUT;
 /* Miscellaneous BSP definitions */
 #define KIT_ID                (0x0009UL)    // For GUI's recognition of HW
 /* CPU load calculation configuration */
-#define CPU_LOAD_CALC_ENABLED           (1U)      // Set to (0U) to disable CPU load measurement
+#define CPU_LOAD_CALC_ENABLED           (0U)      // Set to (0U) to disable CPU load measurement // its 100 ms busy-wait starved door.c in the main loop
 #define CPU_LOAD_CALC_TIMEOUT           (10.0f)   // [s] Overflow threshold: cpu_load set to 100% if exceeded
 #define CPU_LOAD_CALC_IDLE_TASKTIME     (0.100f)  // [s] Idle busy-wait measurement window
 #define CPU_LOAD_CALC_IDLE_TASKOVERHEAD (0.000f)  // [s] Known overhead to subtract from idle measurement

@@ -25,11 +25,13 @@
 #define DOOR_OPEN_WINDOW_MS     (120U)    /* an opening count newer than this keeps resisting */
 #define DOOR_RESIST_MAX_MS      (10000U)
 #define DOOR_COOLDOWN_MS        (3000U)
-#define DOOR_OVERSPEED_CPS      (120.0f)  /* 5 rev/s while winding: string slack or broken */
-#define DOOR_RUNAWAY_CPS        (600.0f)  /* 25 rev/s either way: no hand opens a door this fast */
+/* Speed limits assume the string wraps straight onto the 5 mm shaft: 1 cm of string = 15 counts */
+#define DOOR_OVERSPEED_CPS      (400.0f)  /* 17 rev/s (~26 cm/s of string) while winding: string slack or broken */
+#define DOOR_RUNAWAY_CPS        (1500.0f) /* 62 rev/s either way: faster than any hand pulls */
 #define DOOR_RAMP_UP_A_PER_MS   (0.10f)
 #define DOOR_RAMP_DOWN_A_PER_MS (0.02f)
 #define DOOR_CPS_WINDOW_MS      (100U)
+#define DOOR_TICK_HZ            (10000U)  /* SysTick rate: Hall sampling and the ms clock */
 
 DOOR_t door =
 {
@@ -53,8 +55,8 @@ static uint32_t last_hb_ms = 0U;
 static uint32_t state_since_ms = 0U;
 static int32_t pos_window_start = 0;
 static uint32_t window_start_ms = 0U;
-static uint32_t cyc_prev = 0U;
 static uint32_t ms_prev = 0U;
+static uint32_t ticks_in_ms = 0U;
 
 static uint32_t ReadHall(void)
 {
@@ -159,7 +161,11 @@ static void Control(uint32_t now_ms)
         break;
     case DOOR_RESIST:
         target = MAX(i_resist, i_take);
-        if (!opening)
+        if (overspeed)
+        {
+            SetState(DOOR_COOLDOWN, now_ms);
+        }
+        else if (!opening)
         {
             SetState(DOOR_IDLE, now_ms);
         }
@@ -202,35 +208,31 @@ static void Control(uint32_t now_ms)
     vars_ptr->en = (door.state != DOOR_DISARMED);
 }
 
+/* Lowest priority, so it never delays the motor control ISRs, but it still
+ * preempts the main loop and samples the Hall code even if the loop blocks. */
+void SysTick_Handler(void)
+{
+    if (++ticks_in_ms >= (DOOR_TICK_HZ / 1000U))
+    {
+        ticks_in_ms = 0U;
+        door.fw_ms++;
+    }
+    TrackHall(door.fw_ms);
+}
+
 void DOOR_Init(void)
 {
-#if defined(DCB)
-    DCB->DEMCR |= DCB_DEMCR_TRCENA_Msk;
-#else
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-#endif
-    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
-    cyc_prev = DWT->CYCCNT;
-
     /* Start disarmed: the shaft turns freely until the host takes over */
     door.state = DOOR_DISARMED;
     motor[0].vars_ptr->cmd_ext = 0.0f;
     motor[0].vars_ptr->en = false;
+
+    (void)SysTick_Config(SystemCoreClock / DOOR_TICK_HZ);
+    NVIC_SetPriority(SysTick_IRQn, (1UL << __NVIC_PRIO_BITS) - 1UL);
 }
 
 void DOOR_Run(void)
 {
-    uint32_t cyc_per_ms = SystemCoreClock / 1000U;
-    uint32_t cyc = DWT->CYCCNT;
-    while ((uint32_t)(cyc - cyc_prev) >= cyc_per_ms)
-    {
-        cyc_prev += cyc_per_ms;
-        door.fw_ms++;
-    }
-
-    /* Sample the Hall code on every call so no transition is missed */
-    TrackHall(door.fw_ms);
-
     if (door.fw_ms != ms_prev)
     {
         ms_prev = door.fw_ms;

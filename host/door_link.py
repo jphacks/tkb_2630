@@ -112,7 +112,7 @@ def fmt(d):
     return (
         f"t={d.fw_ms/1000:8.2f}s  {STATE_NAMES.get(d.state, d.state):9s} "
         f"hall={d.hall_uvw:03b} pos={d.pos:6d} ({d.pos/24:+6.2f} rev) "
-        f"cps={d.cps:+7.1f} i={d.i_cmd:4.2f}A err={d.hall_errors}"
+        f"cps={d.cps:+7.1f} i={d.i_cmd:4.2f}A lv={d.level:.2f} err={d.hall_errors}"
     )
 
 
@@ -127,13 +127,17 @@ def monitor(link, args):
 def calibrate(link, args):
     # With nothing on the shaft, a small positive current spins it one way.
     # That way is "winding" when wind_sign = +1, so opening is the other way.
+    # The drive spends 0.25 s charging bootstrap capacitors before current flows,
+    # so wait for the shaft to actually move, then cut it after a few counts.
     link.write(armed=0, level=0.0, i_take=args.current, i_resist_max=args.current, open_dir=+1, wind_sign=+1)
     start = link.read()
     link.start_heartbeat()
     link.write(armed=1)
-    time.sleep(args.seconds)
+    deadline = time.time() + args.seconds
+    while time.time() < deadline and abs(link.read().pos - start.pos) < 3:
+        time.sleep(0.005)
     link.write(armed=0)
-    time.sleep(0.3)
+    time.sleep(0.5)
     end = link.read()
     moved = end.pos - start.pos
     print(f"pos moved {moved:+d} counts with positive current")
@@ -151,10 +155,28 @@ def run(link, args):
     )
     link.start_heartbeat()
     link.write(armed=1)
-    print(f"armed: level={args.level} i_take={args.i_take}A i_max={args.i_max}A. Ctrl+C to disarm.")
-    while True:
+    print(f"armed: level={args.level} i_take={args.i_take}A i_max={args.i_max}A")
+    print("type a level 0-1 and Enter to change it live; q or Ctrl+C to disarm")
+
+    stop = threading.Event()
+
+    def read_levels():
+        for line in sys.stdin:
+            text = line.strip()
+            if text == "q":
+                break
+            try:
+                level = min(max(float(text), 0.0), 1.0)
+            except ValueError:
+                continue
+            link.write(level=level)
+            print(f"level -> {level}")
+        stop.set()
+
+    threading.Thread(target=read_levels, daemon=True).start()
+    while not stop.is_set():
         print(fmt(link.read()))
-        time.sleep(0.1)
+        time.sleep(0.2)
 
 
 def main():
@@ -164,11 +186,12 @@ def main():
     sub.add_parser("monitor")
     c = sub.add_parser("calibrate")
     c.add_argument("--current", type=float, default=0.2)
-    c.add_argument("--seconds", type=float, default=0.15)
+    c.add_argument("--seconds", type=float, default=1.0, help="give up if the shaft has not moved by then")
     r = sub.add_parser("run")
-    r.add_argument("--level", type=float, default=0.5)
-    r.add_argument("--i-take", type=float, default=0.3)
-    r.add_argument("--i-max", type=float, default=2.0)
+    r.add_argument("--level", type=float, default=0.0, help="start at take-up only, raise it live")
+    # Defaults suit string wrapped straight on the 5 mm shaft: 1 A pulls ~14 N
+    r.add_argument("--i-take", type=float, default=0.2, help="[A] take-up, ~3 N on the bare shaft")
+    r.add_argument("--i-max", type=float, default=1.0, help="[A] at level 1, ~14 N on the bare shaft")
     r.add_argument("--open-dir", type=int, choices=(-1, 1), required=True)
     r.add_argument("--wind-sign", type=int, choices=(-1, 1), default=1)
     args = p.parse_args()
