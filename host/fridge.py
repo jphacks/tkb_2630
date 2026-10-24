@@ -1,6 +1,8 @@
 """タスクの達成度を、冷蔵庫のドアの重さに変換する。
 
-door_link.py の DoorLink をそのまま使い、その上に「何を終えたか」の層を載せる。
+「何を終えたか」から level を決めて control.json に書く。ボードと話すのは
+door_link.py の run（./run-string.sh）だけで、そちらが control.json を読み直し、
+mounts/*.json の設定・開閉ログ・再接続を受け持つ。
 タスクは tasks.json に保存される。
 
     python fridge.py list                  # タスク一覧と、いまの重さを表示
@@ -9,8 +11,9 @@ door_link.py の DoorLink をそのまま使い、その上に「何を終えた
     python fridge.py add "レポートを出す"   # タスクを追加
     python fridge.py reset                 # 全部未完了に戻す（翌日の朝など）
 
-    python fridge.py run --open-dir -1     # ドアに接続して常駐する（要ハードウェア）
-    python fridge.py run --no-door         # ハードなしで動作確認（levelを表示するだけ）
+    ./run-string.sh                        # 窓1: ボードにつなぐ（先に起動しておく）
+    python fridge.py run                   # 窓2: tasks.json を見て level を control.json に書く
+    python fridge.py run --dry-run         # control.json に書かず、送るはずの level を表示するだけ
 """
 
 import argparse
@@ -21,6 +24,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TASKS_PATH = os.path.join(HERE, "tasks.json")
+CONTROL_PATH = os.path.join(HERE, "control.json")  # door_link.py run が mtime の変化で読み直す
 
 # 未完了の数 → level(0..1) の対応表。
 # 人間が重さの違いを感じ取れるのは 10% 程度の差からなので、
@@ -113,33 +117,29 @@ def cmd_reset(args):
     show(tasks)
 
 
-# --- ドアに繋ぐコマンド ---
+# --- ドアに level を渡すコマンド ---
+
+def write_level(level):
+    """control.json に {"level": X} を書く。
+
+    run は mtime の変化で読み直すので、書きかけを読まれると JSON が壊れる。
+    tmp に書いてから os.replace で一度に差し替える。
+    """
+    tmp = CONTROL_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"level": level}, f)
+    os.replace(tmp, CONTROL_PATH)
+
 
 def cmd_run(args):
-    """tasks.json を監視して、変化したら level をドアに送る。
+    """tasks.json を監視して、level が変わったら control.json に書く。
 
-    --no-door ならハードウェアに繋がず、送るはずだった level を表示するだけ。
-    相方がボードを持っている間の動作確認に使う。
+    --dry-run（別名 --no-door）なら control.json に書かず、送るはずの level を表示するだけ。
     """
-    link = None
-    if not args.no_door:
-        # ここで初めて import する。--no-door なら pylink が無くても動かせる。
-        from door_link import DoorLink
-
-        link = DoorLink()
-        link.write(
-            armed=0,
-            level=0.0,
-            i_take=args.i_take,
-            i_resist_max=args.i_max,
-            open_dir=args.open_dir,
-            wind_sign=args.wind_sign,
-        )
-        link.start_heartbeat()
-        link.write(armed=1)
-        print(f"ドアに接続しました（i_take={args.i_take}A i_max={args.i_max}A）")
+    if args.dry_run:
+        print("--dry-run: control.json には書きません")
     else:
-        print("--no-door: ハードウェアには繋ぎません")
+        print(f"level を {CONTROL_PATH} に書きます（先に ./run-string.sh を起動しておく）")
 
     print("tasks.json を監視中。別の端末から done / undo を実行してください。Ctrl+C で終了。\n")
 
@@ -149,16 +149,12 @@ def cmd_run(args):
             level = level_for(load_tasks())
             if level != last:
                 print(f"level -> {level:.2f}  ({describe(level)})")
-                if link:
-                    link.write(level=level)
+                if not args.dry_run:
+                    write_level(level)
                 last = level
             time.sleep(0.5)
     except KeyboardInterrupt:
         pass
-    finally:
-        if link:
-            link.close()
-            print("\n切断しました")
 
 
 def main():
@@ -183,16 +179,12 @@ def main():
     a.set_defaults(func=cmd_add)
 
     r = sub.add_parser("run")
-    r.add_argument("--no-door", action="store_true", help="ハードウェアに繋がず動作確認する")
-    r.add_argument("--open-dir", type=int, choices=(-1, 1), help="calibrate で調べた値")
-    r.add_argument("--wind-sign", type=int, choices=(-1, 1), default=1)
-    r.add_argument("--i-take", type=float, default=0.2)
-    r.add_argument("--i-max", type=float, default=1.0)
+    # 電流や向きは mounts/*.json に一本化したので、ここでは持たない
+    r.add_argument("--dry-run", "--no-door", dest="dry_run", action="store_true",
+                   help="control.json に書かず、送るはずの level を表示するだけ")
     r.set_defaults(func=cmd_run)
 
     args = p.parse_args()
-    if args.cmd == "run" and not args.no_door and args.open_dir is None:
-        p.error("run にはハードウェアが要ります。--open-dir を指定するか --no-door を付けてください")
     args.func(args)
 
 
