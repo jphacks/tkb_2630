@@ -16,10 +16,11 @@
     "buzzhz": 40,
     "buzzms": 200,
     "buzzlevel": 0.5,
-    "relentdelay": 800,
-    "relent": 2500,
-    "floor": 0.3,
-    "recover": 1500
+    "relentdelay": 1000,
+    "relent": 2000,
+    "floor": 0.0,
+    "recover": 1500,
+    "release": 3
   },
   "profiles": {
     "day": {"level": 0.4, "max": 1.5, "damp": 0.0, "buzzlevel": 1.1},

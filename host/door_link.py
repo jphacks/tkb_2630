@@ -89,9 +89,10 @@ class Door:
     relent_floor: float
     recover_ms: int
     strength: float
+    release_counts: int
 
 
-FORMAT = "<IIfffiiIifIIIffffIIIiiii" "fffIIfi" "fIIIfffiII" "IIf" "IIfIf"
+FORMAT = "<IIfffiiIifIIIffffIIIiiii" "fffIIfi" "fIIIfffiII" "IIf" "IIfIf" "i"
 
 # Bit order of FAULT_FLAGS_t.sw in motor-ctrl-lib (CTRL_METHOD_RFO)
 FAULT_NAMES = ["oc", "ot_ps", "ov_vdc", "uv_vdc", "os", "hall", "params", "brk", "em_stop",
@@ -120,12 +121,25 @@ class DoorLink:
     def __init__(self, elf=DEFAULT_ELF):
         self.addr = find_symbol(elf, "door")
         self.jlink = pylink.JLink()
-        self.jlink.open()
-        self.jlink.set_tif(pylink.enums.JLinkInterfaces.SWD)
-        self.jlink.connect(JLINK_DEVICE, speed=4000)
         self._lock = threading.Lock()
         self._hb_stop = threading.Event()
         self._hb_thread = None
+        self._attach()
+
+    def _attach(self):
+        self.jlink.open()
+        self.jlink.set_tif(pylink.enums.JLinkInterfaces.SWD)
+        self.jlink.connect(JLINK_DEVICE, speed=4000)
+
+    def reconnect(self):
+        """After the board lost power or USB: drop the old session and attach again."""
+        self.stop_heartbeat()
+        with self._lock:
+            try:
+                self.jlink.close()
+            except pylink.errors.JLinkException:
+                pass
+            self._attach()
 
     def read(self):
         with self._lock:
@@ -139,22 +153,34 @@ class DoorLink:
                 self.jlink.memory_write32(self.addr + OFFSET[name], [raw])
 
     def start_heartbeat(self, period=0.05):
+        # If the link drops, the beat just stops: the firmware disarms on its own
+        # and the caller reconnects.
         def beat():
-            hb = self.read().host_hb
-            while not self._hb_stop.is_set():
-                hb = (hb + 1) & 0xFFFFFFFF
-                self.write(host_hb=hb)
-                time.sleep(period)
+            try:
+                hb = self.read().host_hb
+                while not self._hb_stop.is_set():
+                    hb = (hb + 1) & 0xFFFFFFFF
+                    self.write(host_hb=hb)
+                    time.sleep(period)
+            except pylink.errors.JLinkException:
+                pass
 
+        self._hb_stop.clear()
         self._hb_thread = threading.Thread(target=beat, daemon=True)
         self._hb_thread.start()
 
-    def close(self):
+    def stop_heartbeat(self):
         self._hb_stop.set()
         if self._hb_thread:
             self._hb_thread.join(timeout=1)
+            self._hb_thread = None
+
+    def close(self):
+        self.stop_heartbeat()
         try:
             self.write(armed=0)
+        except pylink.errors.JLinkException:
+            pass  # board already gone: it disarms itself without a heartbeat
         finally:
             self.jlink.close()
 
@@ -236,6 +262,7 @@ SETTINGS = {
     "relent": ("relent_ms", 20000, True),  # 0: never give in
     "floor": ("relent_floor", 1.0, False),
     "recover": ("recover_ms", 20000, True),
+    "release": ("release_counts", 240, True),  # move back this far while resisting = let go
 }
 
 
@@ -260,7 +287,7 @@ MOUNTS = load_mounts()
 
 HELP = ("type 0-1 for a level; 'max 2', 'take 0.3', 'free 36', 'ramp 24', 'damp 0.01', "
         "'buzzamp 0.6', 'buzzhz 40', 'buzzms 200', 'buzzlevel 0.5', 'full 72', 'window 120', "
-        "'hold 1', 'closecps 60', 'relentdelay 800', 'relent 2500', 'floor 0.3', 'recover 1500'; "
+        "'hold 1', 'closecps 60', 'relentdelay 1000', 'relent 2000', 'floor 0', 'recover 1500', 'release 3'; "
         "'buzz' to buzz now; 'profile day|night|off'; q to stop")
 
 
@@ -287,10 +314,13 @@ def run(link, args):
     def buzz():
         link.write(buzz_req=(link.read().buzz_req + 1) & 0xFFFFFFFF)
 
-    link.write(armed=0, open_dir=open_dir, wind_sign=wind_sign)
-    apply()
-    link.start_heartbeat()
-    link.write(armed=1)
+    def arm():
+        link.write(armed=0, open_dir=open_dir, wind_sign=wind_sign)
+        apply()
+        link.start_heartbeat()
+        link.write(armed=1)
+
+    arm()
     print("armed. " + HELP)
     print(f"(with a Japanese IME on, Enter only confirms the text: press it twice) or edit {CONTROL_FILE}")
 
@@ -314,6 +344,8 @@ def run(link, args):
                     print("? " + HELP)
             except ValueError:
                 print("? " + HELP)
+            except pylink.errors.JLinkException:
+                print("! board not reachable right now; the setting is applied after reconnecting")
         stop.set()
 
     threading.Thread(target=read_commands, daemon=True).start()
@@ -341,7 +373,23 @@ def run(link, args):
         seen_events = link.read().ev_count
         n = 0
         while not stop.is_set():
-            d = link.read()
+            try:
+                d = link.read()
+            except pylink.errors.JLinkException as e:
+                # Power or USB dropped. Without the heartbeat the firmware has already
+                # disarmed, so just keep trying, then send the settings and arm again.
+                print(f"! lost the board ({e}); retrying every second. Check the 24 V adapter and USB.")
+                while not stop.is_set():
+                    time.sleep(1.0)
+                    try:
+                        link.reconnect()
+                        arm()
+                        seen_events = link.read().ev_count
+                        print("reconnected and armed again")
+                        break
+                    except pylink.errors.JLinkException:
+                        continue
+                continue
             log.writerow([f"{time.time():.3f}", d.fw_ms, STATE_NAMES.get(d.state, d.state),
                           d.pos, f"{d.cps:.1f}", f"{d.i_cmd:.3f}", f"{d.level:.2f}",
                           f"{d.iq_fb:.3f}", f"{d.iq_ref:.3f}", f"{d.vdc:.2f}", d.lib_state, d.lib_flags,
@@ -372,6 +420,8 @@ def run(link, args):
                     apply(**{k: v for k, v in data.items() if k in SETTINGS})
                 except (OSError, ValueError) as e:
                     print(f"? {CONTROL_FILE}: {e}")
+                except pylink.errors.JLinkException:
+                    pass  # applied by arm() after reconnecting
             time.sleep(0.05)
     print(f"log: {log_path}")
 

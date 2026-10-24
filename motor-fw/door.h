@@ -93,6 +93,11 @@ typedef struct
 
     /* Telemetry */
     volatile float strength;          /* 0..1 multiplier on the spring, damping and hold */
+
+    /* Written by the host: how far the door must move back from its furthest point
+     * while resisting before we treat it as let go. A single count would chatter
+     * whenever the motor slightly outpulls the hand. */
+    volatile int32_t release_counts;
 } DOOR_t;
 
 extern DOOR_t door;

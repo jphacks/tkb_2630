@@ -6,10 +6,12 @@
 *              so opening the door turns the motor. While the door opens we
 *              command torque in the winding direction, building up with the
 *              distance opened after some free travel (spring) and with the
-*              opening speed (damping); the moment it stops or closes we drop
-*              back to a small take-up current so the door never slams shut on
-*              a hand. Opening at a high level starts with a short buzz, and
-*              every opening is measured as the work done against the motor.
+*              opening speed (damping). A hand holding the door still keeps
+*              the tug going; the moment the door moves back we drop to a small
+*              take-up current, so the motor never pulls the door shut. Like a
+*              person, it gives in to a steady pull, so the door always opens
+*              in the end. Opening at a high level starts with a short buzz,
+*              and every opening is measured as the work done against the motor.
 *
 * The string can only pull, so the commanded current is always in the winding
 * direction and never negative.
@@ -50,6 +52,8 @@
 #define DOOR_BUZZ_MAX_MS        (1000U)
 #define DOOR_EVENT_REST_MS      (1500U)   /* an opening ends after this long without movement */
 #define DOOR_HOLD_MAX_MS        (10000U)  /* thermal: stop pushing a door that is kept open */
+#define DOOR_RESIST_STILL_MS    (1500U)   /* resisting a door held still ends after this */
+#define DOOR_RELENT_PARTIAL_MS  (1500U)   /* extra wait before giving in to a tug that stalls short of full strength */
 
 DOOR_t door =
 {
@@ -69,11 +73,12 @@ DOOR_t door =
     .open_window_ms = 120U,
     .hold_spring = 0U,
     .close_cps_max = 60.0f,
-    .relent_delay_ms = 800U,
-    .relent_ms = 2500U,
-    .relent_floor = 0.3f,
+    .relent_delay_ms = 1000U,
+    .relent_ms = 2000U,
+    .relent_floor = 0.0f,  /* gives in completely: the door always opens in the end */
     .recover_ms = 1500U,
     .strength = 1.0f,
+    .release_counts = 3,
 };
 
 /* Hall code (u | v << 1 | w << 2) -> sector 0..5 along the DB42M03 sequence.
@@ -110,8 +115,9 @@ static float ev_peak_iq = 0.0f;
 static int32_t ev_max_dist = 0;
 static bool holding = false;
 static uint32_t hold_start_ms = 0U;
-static bool pushing = false;    /* the motor is resisting someone (resist past free travel, or holding) */
-static uint32_t push_start_ms = 0U;
+static uint32_t engaged_ms = 0U; /* time spent resisting someone in the current opening */
+static uint32_t full_ms = 0U;    /* of that, time at full spring strength */
+static int32_t resist_peak = 0;  /* furthest open_dist since resisting began */
 
 static uint32_t ReadHall(void)
 {
@@ -217,7 +223,7 @@ static void TrackOpening(uint32_t now_ms, float iq_abs)
     ev_max_dist = MAX(ev_max_dist, door.open_dist);
 
     bool closed = (door.open_dist <= 0) && ((now_ms - ev_start_ms) > 200U);
-    bool still = (now_ms - last_count_ms) > DOOR_EVENT_REST_MS;
+    bool still = ((now_ms - last_count_ms) > DOOR_EVENT_REST_MS) && (door.state != DOOR_RESIST);
     if (closed || still || (door.state == DOOR_DISARMED))
     {
         door.last_energy_mj = door.ev_energy_mj;
@@ -281,28 +287,40 @@ static void Control(uint32_t now_ms)
     bool hold_on = (door.hold_spring != 0U) && holding && ((now_ms - hold_start_ms) < DOOR_HOLD_MAX_MS) &&
                    (v_close < door.close_cps_max);
 
-    /* Give in like a person: a steady push against the motor wears its strength
-     * down after a moment, and it comes back once nobody pushes */
-    bool push_now = open_past_free && ((door.state == DOOR_RESIST) || hold_on);
-    if (push_now && !pushing)
-    {
-        push_start_ms = now_ms;
-    }
-    pushing = push_now;
+    /* How far into the spring: 0 during free travel, 1 once fully built up */
+    float build = Clamp((float)(door.open_dist - door.free_counts) / (float)MAX(door.ramp_counts, 1), 0.0f, 1.0f);
+
+    /* Give in like a person, so the door always opens in the end: hold full strength
+     * for relent_delay_ms once the spring is fully built up, then wear down to
+     * relent_floor. Time adds up over the whole opening, pauses included; a tug that
+     * stalls before full strength gives in too, after DOOR_RELENT_PARTIAL_MS more.
+     * It only comes back once that opening is over (door closed, or left alone). */
+    bool engaged = open_past_free && ((door.state == DOOR_RESIST) || hold_on);
     float relent_floor = Clamp(door.relent_floor, 0.0f, 1.0f);
-    if (pushing && (door.relent_ms > 0U) && ((now_ms - push_start_ms) > door.relent_delay_ms))
+    if (!door.ev_active && !engaged)
     {
-        door.strength = MAX(relent_floor, door.strength - (1.0f - relent_floor) / (float)door.relent_ms);
-    }
-    else if (!pushing)
-    {
+        engaged_ms = 0U;
+        full_ms = 0U;
         door.strength = MIN(1.0f, door.strength + 1.0f / (float)MAX(door.recover_ms, 1U));
+    }
+    else if (engaged)
+    {
+        engaged_ms++;
+        if (build >= 1.0f)
+        {
+            full_ms++;
+        }
+        bool held_long_enough = (full_ms > door.relent_delay_ms) ||
+                                (engaged_ms > door.relent_delay_ms + DOOR_RELENT_PARTIAL_MS);
+        if (held_long_enough && (door.relent_ms > 0U))
+        {
+            door.strength = MAX(relent_floor, door.strength - (1.0f - relent_floor) / (float)door.relent_ms);
+        }
     }
 
     /* Free travel first, then a spring that builds up with distance, plus damping
      * that grows with the opening speed. All scale with the level and the strength. */
     float level = Clamp(door.level, 0.0f, 1.0f) * Clamp(door.strength, 0.0f, 1.0f);
-    float build = Clamp((float)(door.open_dist - door.free_counts) / (float)MAX(door.ramp_counts, 1), 0.0f, 1.0f);
     float v_open = MAX(door.vel_cps * (float)open_dir, 0.0f);
     float i_take = Clamp(door.i_take, 0.0f, DOOR_I_LIMIT);
     float i_spring = level * build * (Clamp(door.i_resist_max, 0.0f, DOOR_I_LIMIT) - i_take);
@@ -335,6 +353,7 @@ static void Control(uint32_t now_ms)
         else if (opening)
         {
             SetState(DOOR_RESIST, now_ms);
+            resist_peak = door.open_dist;
             if (Clamp(door.level, 0.0f, 1.0f) >= door.buzz_min_level)
             {
                 StartBuzz(now_ms); /* a warning shiver as the hand starts to open */
@@ -342,12 +361,22 @@ static void Control(uint32_t now_ms)
         }
         break;
     case DOOR_RESIST:
+        /* Keep resisting while the hand holds the door against us, so a steady pull is
+         * a steady tug rather than catch-and-release. Stop as soon as the door has moved
+         * back release_counts from its furthest point (the hand let go: never pull it
+         * shut), or once it has been still a while. */
         target = MAX(i_resist, i_take);
+        resist_peak = MAX(resist_peak, door.open_dist);
         if (overspeed)
         {
             SetState(DOOR_COOLDOWN, now_ms);
         }
-        else if (!opening)
+        else if (door.open_dist <= resist_peak - MAX(door.release_counts, 1))
+        {
+            SetState(DOOR_IDLE, now_ms);
+            i_base = MIN(i_base, i_take);
+        }
+        else if (!opening && ((now_ms - last_count_ms) > DOOR_RESIST_STILL_MS))
         {
             SetState(DOOR_IDLE, now_ms);
         }
