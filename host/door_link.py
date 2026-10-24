@@ -32,6 +32,7 @@ NM = os.path.expanduser("~/Applications/mtb-gcc-arm-eabi/14.2.1/gcc/bin/arm-none
 JLINK_DEVICE = "PSC3xxF"  # attach without reset; the _tm variant resets into test mode
 CONTROL_FILE = os.path.join(HERE, "control.json")  # e.g. {"level": 0.5}; read by `run` when it changes
 LOG_DIR = os.path.join(HERE, "logs")
+MOUNT_DIR = os.path.join(HERE, "mounts")
 
 STATE_NAMES = {0: "DISARMED", 1: "IDLE", 2: "RESIST", 3: "COOLDOWN"}
 
@@ -59,9 +60,38 @@ class Door:
     lib_state: int
     lib_flags: int
     fault_sw: int
+    free_counts: int
+    ramp_counts: int
+    home_pos: int
+    open_dist: int
+    k_damp: float
+    buzz_amp: float
+    buzz_hz: float
+    buzz_ms: int
+    buzz_req: int
+    buzz_min_level: float
+    full_counts: int
+    vel_cps: float
+    buzz_left_ms: int
+    ev_active: int
+    ev_count: int
+    ev_energy_mj: float
+    last_energy_mj: float
+    last_peak_iq: float
+    last_max_dist: int
+    last_duration_ms: int
+    last_gave_up: int
+    open_window_ms: int
+    hold_spring: int
+    close_cps_max: float
+    relent_delay_ms: int
+    relent_ms: int
+    relent_floor: float
+    recover_ms: int
+    strength: float
 
 
-FORMAT = "<IIfffiiIifIIIffffIII"
+FORMAT = "<IIfffiiIifIIIffffIIIiiii" "fffIIfi" "fIIIfffiII" "IIf" "IIfIf"
 
 # Bit order of FAULT_FLAGS_t.sw in motor-ctrl-lib (CTRL_METHOD_RFO)
 FAULT_NAMES = ["oc", "ot_ps", "ov_vdc", "uv_vdc", "os", "hall", "params", "brk", "em_stop",
@@ -70,6 +100,8 @@ FAULT_NAMES = ["oc", "ot_ps", "ov_vdc", "uv_vdc", "os", "hall", "params", "brk",
 
 def fault_names(bits):
     return ",".join(n for i, n in enumerate(FAULT_NAMES) if bits >> i & 1)
+
+
 WORDS = struct.calcsize(FORMAT) // 4
 OFFSET = {f.name: 4 * i for i, f in enumerate(fields(Door))}
 FIELD_FMT = dict(zip(OFFSET, FORMAT[1:]))
@@ -131,10 +163,20 @@ def fmt(d):
     return (
         f"t={d.fw_ms/1000:8.2f}s  {STATE_NAMES.get(d.state, d.state):9s} "
         f"hall={d.hall_uvw:03b} pos={d.pos:6d} ({d.pos/24:+6.2f} rev) "
-        f"cps={d.cps:+7.1f} i={d.i_cmd:4.2f}A iq={d.iq_fb:+5.2f}A "
+        f"open={d.open_dist:4d} v={d.vel_cps:+6.0f} i={d.i_cmd:4.2f}A iq={d.iq_fb:+5.2f}A "
         f"{'CL' if d.lib_flags & 1 else ('FAULT' if d.lib_flags & 2 else f'lib{d.lib_state}')} "
-        f"lv={d.level:.2f} err={d.hall_errors}"
+        f"lv={d.level:.2f} s={d.strength:.2f} err={d.hall_errors}"
+        + (f" E={d.ev_energy_mj / 1000:.2f}J" if d.ev_active else "")
+        + (" BUZZ" if d.buzz_left_ms else "")
         + (f" faults=[{fault_names(d.fault_sw)}]" if d.fault_sw else "")
+    )
+
+
+def fmt_event(d):
+    return (
+        f"opening #{d.ev_count}: {d.last_energy_mj / 1000:.2f} J, peak {d.last_peak_iq:.2f} A, "
+        f"{d.last_max_dist} counts in {d.last_duration_ms / 1000:.1f} s"
+        + (" -> gave up" if d.last_gave_up else " -> opened")
     )
 
 
@@ -174,23 +216,82 @@ def clamp(x, lo, hi):
     return min(max(x, lo), hi)
 
 
-LIMITS = {"level": 1.0, "i_take": 3.0, "i_max": 3.0}
+# Host setting -> (DOOR_t field, upper limit, is integer)
+SETTINGS = {
+    "level": ("level", 1.0, False),
+    "take": ("i_take", 3.0, False),
+    "max": ("i_resist_max", 3.0, False),
+    "free": ("free_counts", 2400, True),
+    "ramp": ("ramp_counts", 2400, True),
+    "damp": ("k_damp", 0.5, False),
+    "buzzamp": ("buzz_amp", 1.0, False),
+    "buzzhz": ("buzz_hz", 100.0, False),
+    "buzzms": ("buzz_ms", 1000, True),
+    "buzzlevel": ("buzz_min_level", 1.1, False),  # above 1 never buzzes on opening
+    "full": ("full_counts", 2400, True),
+    "window": ("open_window_ms", 2000, True),
+    "hold": ("hold_spring", 1, True),
+    "closecps": ("close_cps_max", 1000.0, False),
+    "relentdelay": ("relent_delay_ms", 10000, True),
+    "relent": ("relent_ms", 20000, True),  # 0: never give in
+    "floor": ("relent_floor", 1.0, False),
+    "recover": ("recover_ms", 20000, True),
+}
+
+
+def load_mounts():
+    """One JSON per way of mounting the motor (host/mounts/*.json): starting
+    settings, door direction and the day/night/off feel presets."""
+    mounts = {}
+    for name in sorted(os.listdir(MOUNT_DIR)):
+        if not name.endswith(".json"):
+            continue
+        with open(os.path.join(MOUNT_DIR, name)) as f:
+            mount = json.load(f)
+        for values in [mount["settings"], *mount["profiles"].values()]:
+            unknown = set(values) - set(SETTINGS) - {"level"}
+            if unknown:
+                sys.exit(f"{name}: unknown settings {sorted(unknown)}")
+        mounts[name[:-len(".json")]] = mount
+    return mounts
+
+
+MOUNTS = load_mounts()
+
+HELP = ("type 0-1 for a level; 'max 2', 'take 0.3', 'free 36', 'ramp 24', 'damp 0.01', "
+        "'buzzamp 0.6', 'buzzhz 40', 'buzzms 200', 'buzzlevel 0.5', 'full 72', 'window 120', "
+        "'hold 1', 'closecps 60', 'relentdelay 800', 'relent 2500', 'floor 0.3', 'recover 1500'; "
+        "'buzz' to buzz now; 'profile day|night|off'; q to stop")
 
 
 def run(link, args):
-    settings = {"level": args.level, "i_take": args.i_take, "i_max": args.i_max}
+    mount = MOUNTS[args.mount]
+    profiles = mount["profiles"]
+    settings = dict(mount["settings"], level=args.level)
+    for key in ("take", "max", "free", "ramp", "damp", "full"):
+        value = getattr(args, key)
+        if value is not None:  # explicit flags override the mounting's file
+            settings[key] = value
+    open_dir = args.open_dir if args.open_dir is not None else mount["open_dir"]
+    wind_sign = args.wind_sign if args.wind_sign is not None else mount["wind_sign"]
+    print(f"mount: {args.mount} (open_dir={open_dir}, wind_sign={wind_sign})")
 
     def apply(**changes):
         for key, value in changes.items():
-            settings[key] = clamp(float(value), 0.0, LIMITS[key])
-        link.write(level=settings["level"], i_take=settings["i_take"], i_resist_max=settings["i_max"])
-        print(f"-> level={settings['level']:.2f} i_take={settings['i_take']:.2f}A i_max={settings['i_max']:.2f}A")
+            _, hi, is_int = SETTINGS[key]
+            value = clamp(float(value), 0.0, hi)
+            settings[key] = int(value) if is_int else value
+        link.write(**{SETTINGS[k][0]: v for k, v in settings.items()})
+        print("-> " + " ".join(f"{k}={v:g}" for k, v in settings.items()) + "  (counts: 24 per turn)")
 
-    link.write(armed=0, open_dir=args.open_dir, wind_sign=args.wind_sign)
+    def buzz():
+        link.write(buzz_req=(link.read().buzz_req + 1) & 0xFFFFFFFF)
+
+    link.write(armed=0, open_dir=open_dir, wind_sign=wind_sign)
     apply()
     link.start_heartbeat()
     link.write(armed=1)
-    print("armed. Type 0.3 + Enter for a level, 'max 2' / 'take 0.3' for currents, q to stop.")
+    print("armed. " + HELP)
     print(f"(with a Japanese IME on, Enter only confirms the text: press it twice) or edit {CONTROL_FILE}")
 
     stop = threading.Event()
@@ -201,14 +302,18 @@ def run(link, args):
             if words == ["q"]:
                 break
             try:
-                if len(words) == 1:
+                if words == ["buzz"]:
+                    buzz()
+                elif len(words) == 2 and words[0] == "profile" and words[1] in profiles:
+                    apply(**profiles[words[1]])
+                elif len(words) == 1:
                     apply(level=words[0])
-                elif len(words) == 2 and words[0] in ("max", "take"):
-                    apply(**{"i_" + words[0]: words[1]})
+                elif len(words) == 2 and words[0] in SETTINGS:
+                    apply(**{words[0]: words[1]})
                 elif words:
-                    print("? type 0-1 for a level, 'max 2', 'take 0.3' or q")
+                    print("? " + HELP)
             except ValueError:
-                print("? type 0-1 for a level, 'max 2', 'take 0.3' or q")
+                print("? " + HELP)
         stop.set()
 
     threading.Thread(target=read_commands, daemon=True).start()
@@ -222,17 +327,34 @@ def run(link, args):
     seen_mtime = control_mtime()  # ignore whatever an earlier run left there
     os.makedirs(LOG_DIR, exist_ok=True)
     log_path = os.path.join(LOG_DIR, time.strftime("run-%Y%m%d-%H%M%S.csv"))
-    with open(log_path, "w", newline="") as f:
+    events_path = os.path.join(LOG_DIR, "events.csv")  # one row per opening, kept across runs for Think
+    new_events_file = not os.path.exists(events_path)
+    with open(log_path, "w", newline="") as f, open(events_path, "a", newline="") as ef:
         log = csv.writer(f)
         log.writerow(["wall_s", "fw_ms", "state", "pos", "cps", "i_cmd", "level",
-                      "iq_fb", "iq_ref", "vdc", "lib_state", "lib_flags", "faults"])
+                      "iq_fb", "iq_ref", "vdc", "lib_state", "lib_flags", "faults", "open_dist", "home_pos",
+                      "vel_cps", "ev_energy_mj", "buzz_left_ms", "strength"])
+        events = csv.writer(ef)
+        if new_events_file:
+            events.writerow(["wall_s", "local_time", "mount", "energy_mj", "peak_iq", "max_dist", "duration_ms",
+                             "gave_up", "level", "max", "damp", "free", "ramp"])
+        seen_events = link.read().ev_count
         n = 0
         while not stop.is_set():
             d = link.read()
             log.writerow([f"{time.time():.3f}", d.fw_ms, STATE_NAMES.get(d.state, d.state),
                           d.pos, f"{d.cps:.1f}", f"{d.i_cmd:.3f}", f"{d.level:.2f}",
                           f"{d.iq_fb:.3f}", f"{d.iq_ref:.3f}", f"{d.vdc:.2f}", d.lib_state, d.lib_flags,
-                          fault_names(d.fault_sw)])
+                          fault_names(d.fault_sw), d.open_dist, d.home_pos,
+                          f"{d.vel_cps:.1f}", f"{d.ev_energy_mj:.1f}", d.buzz_left_ms, f"{d.strength:.3f}"])
+            if d.ev_count != seen_events:
+                seen_events = d.ev_count
+                events.writerow([f"{time.time():.3f}", time.strftime("%Y-%m-%d %H:%M:%S"), args.mount,
+                                 f"{d.last_energy_mj:.1f}", f"{d.last_peak_iq:.3f}", d.last_max_dist,
+                                 d.last_duration_ms, d.last_gave_up, f"{settings['level']:g}",
+                                 f"{settings['max']:g}", f"{settings['damp']:g}", settings["free"], settings["ramp"]])
+                ef.flush()
+                print(fmt_event(d))
             if n % 4 == 0:
                 print(fmt(d))
             n += 1
@@ -243,7 +365,11 @@ def run(link, args):
                 try:
                     with open(CONTROL_FILE) as cf:
                         data = json.load(cf)
-                    apply(**{k: v for k, v in data.items() if k in settings})
+                    if data.get("buzz"):
+                        buzz()
+                    if data.get("profile") in profiles:
+                        apply(**profiles[data["profile"]])
+                    apply(**{k: v for k, v in data.items() if k in SETTINGS})
                 except (OSError, ValueError) as e:
                     print(f"? {CONTROL_FILE}: {e}")
             time.sleep(0.05)
@@ -259,12 +385,22 @@ def main():
     c.add_argument("--current", type=float, default=0.2)
     c.add_argument("--seconds", type=float, default=1.0, help="give up if the shaft has not moved by then")
     r = sub.add_parser("run")
+    r.add_argument("--mount", choices=sorted(MOUNTS), default="string",
+                   help="settings file in host/mounts/: string = wound on the shaft, "
+                        "hinge = shaft fixed to the door at the hinge")
     r.add_argument("--level", type=float, default=0.0, help="start at take-up only, raise it live")
-    # Defaults suit string wrapped straight on the 5 mm shaft: 1 A pulls ~14 N
-    r.add_argument("--i-take", type=float, default=0.2, help="[A] take-up, ~3 N on the bare shaft")
-    r.add_argument("--i-max", type=float, default=1.0, help="[A] at level 1, ~14 N on the bare shaft")
-    r.add_argument("--open-dir", type=int, choices=(-1, 1), required=True)
-    r.add_argument("--wind-sign", type=int, choices=(-1, 1), default=1)
+    # Unset flags take the mounting's defaults from MOUNTS
+    r.add_argument("--i-take", dest="take", type=float, help="[A] take-up / idle current")
+    r.add_argument("--i-max", dest="max", type=float, help="[A] at level 1")
+    r.add_argument("--free", type=int, help="counts of opening with take-up only (24 per turn)")
+    r.add_argument("--ramp", type=int, help="counts over which resistance builds up to the level")
+    r.add_argument("--damp", type=float, help="[A per count/s] extra resistance with opening speed")
+    r.add_argument("--full", type=int, help="counts that count as fully opened (less = gave up)")
+    r.add_argument("--open-dir", type=int, choices=(-1, 1),
+                   help="sign of the count change when the door opens (see monitor); default from the mount file")
+    r.add_argument("--wind-sign", type=int, choices=(-1, 1),
+                   help="sign of the current that closes the door; on this motor +current lowers pos, "
+                        "so it equals --open-dir; default from the mount file")
     args = p.parse_args()
 
     link = DoorLink(args.elf)

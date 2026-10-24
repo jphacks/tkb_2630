@@ -46,6 +46,53 @@ typedef struct
     volatile uint32_t lib_state;    /* raw STATE_ID_t of the motor control library */
     volatile uint32_t lib_flags;    /* bit0: in Current_CL, bit1: in Fault */
     volatile uint32_t fault_sw;     /* latched software fault bits of the library (FAULT_FLAGS_t.sw) */
+
+    /* Written by the host: how far the door opens before resistance builds up */
+    volatile int32_t free_counts;   /* opening distance with take-up only */
+    volatile int32_t ramp_counts;   /* distance over which resistance grows to `level` */
+
+    /* Telemetry */
+    volatile int32_t home_pos;      /* pos of the closed door: the most-wound position seen at rest */
+    volatile int32_t open_dist;     /* counts opened past home */
+
+    /* Written by the host: feel of the door */
+    volatile float k_damp;          /* [A per count/s] viscous resistance while opening */
+    volatile float buzz_amp;        /* [A] tension wobble added for the warning buzz (capped at 1 A) */
+    volatile float buzz_hz;         /* buzz frequency */
+    volatile uint32_t buzz_ms;      /* buzz length */
+    volatile uint32_t buzz_req;     /* host increments this to buzz now */
+    volatile float buzz_min_level;  /* opening at this level or above starts with a buzz */
+    volatile int32_t full_counts;   /* opening this far counts as "got it"; less is "gave up" */
+
+    /* Telemetry: speed and the energy spent opening ("how much you wanted it") */
+    volatile float vel_cps;         /* counts per second from Hall edge intervals, low-passed, signed */
+    volatile uint32_t buzz_left_ms;
+    volatile uint32_t ev_active;    /* 1 while an opening is being measured */
+    volatile uint32_t ev_count;     /* number of finished openings */
+    volatile float ev_energy_mj;    /* [mJ] work done against the motor in the current opening */
+    volatile float last_energy_mj;  /* [mJ] of the last finished opening */
+    volatile float last_peak_iq;    /* [A] peak measured current in that opening */
+    volatile int32_t last_max_dist; /* counts: how far that opening got */
+    volatile uint32_t last_duration_ms;
+    volatile uint32_t last_gave_up; /* 1 if it closed again before reaching full_counts */
+
+    /* Written by the host: mounting. A string can only pull while the door opens;
+     * a shaft fixed to the door at the hinge sees only 24 counts per turn
+     * (6 for a 90 degree swing) and can also push the door shut. */
+    volatile uint32_t open_window_ms; /* an opening count newer than this keeps resisting */
+    volatile uint32_t hold_spring;    /* 1: keep the spring force while the door is held open (door closer) */
+    volatile float close_cps_max;     /* holding lets go while the door swings shut faster than this */
+
+    /* Written by the host: give in like a person. After resisting a steady pull for
+     * relent_delay_ms, the strength eases off to relent_floor over relent_ms, and
+     * comes back over recover_ms once nobody is pushing against it. */
+    volatile uint32_t relent_delay_ms;
+    volatile uint32_t relent_ms;      /* 0: never give in */
+    volatile float relent_floor;
+    volatile uint32_t recover_ms;
+
+    /* Telemetry */
+    volatile float strength;          /* 0..1 multiplier on the spring, damping and hold */
 } DOOR_t;
 
 extern DOOR_t door;

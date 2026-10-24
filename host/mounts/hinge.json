@@ -1,0 +1,29 @@
+{
+  "description": "Motor body fixed to the frame on the hinge axis, shaft fixed to the moving door. The shaft turns only as far as the door (6 counts for 90 degrees), so distances are a few counts, opening edges come far apart (long window) and damping needs a larger gain. The motor can push as well, so it holds the door shut like a door closer. Torque acts at the full door width: about 1 N at 3 A for a 10 cm door. Take-up 0.2 A only keeps the current loop running (0.007 N*m): below the library's start threshold each resist would wait 0.25 s for bootstrap charging. Find open_dir with `door_link.py monitor` (open the door: pos up = 1, down = -1); wind_sign equals open_dir on this motor.",
+  "open_dir": 1,
+  "wind_sign": 1,
+  "settings": {
+    "take": 0.2,
+    "max": 3.0,
+    "free": 0,
+    "ramp": 2,
+    "damp": 0.1,
+    "full": 5,
+    "window": 400,
+    "hold": 1,
+    "closecps": 20,
+    "buzzamp": 0.8,
+    "buzzhz": 40,
+    "buzzms": 200,
+    "buzzlevel": 0.5,
+    "relentdelay": 800,
+    "relent": 2500,
+    "floor": 0.3,
+    "recover": 1500
+  },
+  "profiles": {
+    "day": {"level": 0.4, "max": 2.0, "damp": 0.0, "buzzlevel": 1.1},
+    "night": {"level": 1.0, "max": 3.0, "damp": 0.2, "buzzlevel": 0.5},
+    "off": {"level": 0.0, "damp": 0.0, "buzzlevel": 1.1}
+  }
+}

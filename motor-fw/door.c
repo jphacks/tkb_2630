@@ -4,9 +4,15 @@
 * Description: Door-resist logic on top of the motor control library running in
 *              Curr_Mode_FOC_Hall. The string winds onto a spool on the shaft,
 *              so opening the door turns the motor. While the door opens we
-*              command torque in the winding direction; the moment it stops or
-*              closes we drop back to a small take-up current so the door never
-*              slams shut on a hand.
+*              command torque in the winding direction, building up with the
+*              distance opened after some free travel (spring) and with the
+*              opening speed (damping); the moment it stops or closes we drop
+*              back to a small take-up current so the door never slams shut on
+*              a hand. Opening at a high level starts with a short buzz, and
+*              every opening is measured as the work done against the motor.
+*
+* The string can only pull, so the commanded current is always in the winding
+* direction and never negative.
 *
 * Safety rules enforced here, independent of the host:
 *  - drive is off until the host arms it, and again if its heartbeat stops
@@ -29,11 +35,21 @@
 /* Speed limits assume the string wraps straight onto the 5 mm shaft: 1 cm of string = 15 counts */
 #define DOOR_OVERSPEED_CPS      (400.0f)  /* 17 rev/s (~26 cm/s of string) while winding: string slack or broken */
 #define DOOR_RUNAWAY_CPS        (1500.0f) /* 62 rev/s either way: faster than any hand pulls */
-#define DOOR_RAMP_UP_A_PER_MS   (0.10f)
+#define DOOR_RAMP_UP_A_PER_MS   (0.02f)
 #define DOOR_RAMP_DOWN_A_PER_MS (0.02f)
 #define DOOR_CPS_WINDOW_MS      (100U)
 #define DOOR_TICK_HZ            (10000U)  /* SysTick rate: Hall sampling and the ms clock */
 #define DOOR_FAULT_RETRY_MS     (2000U)   /* with an external command source the library never clears faults itself */
+#define DOOR_REHOME_MS          (3000U)   /* at rest this long: take the current position as closed */
+#define DOOR_KT_NM_PER_A        (0.036f)  /* torque constant, Nanotec DB42M03 datasheet */
+#define DOOR_RAD_PER_COUNT      (6.2831853f / 24.0f)
+#define DOOR_VEL_TAU_MS         (20.0f)   /* low-pass on the Hall-interval speed */
+#define DOOR_VEL_STOP_MS        (200U)    /* no Hall edge for this long: speed is zero */
+#define DOOR_BUZZ_AMP_MAX       (1.0f)    /* [A] */
+#define DOOR_BUZZ_HZ_MAX        (100.0f)  /* well inside the 750 Hz current loop bandwidth */
+#define DOOR_BUZZ_MAX_MS        (1000U)
+#define DOOR_EVENT_REST_MS      (1500U)   /* an opening ends after this long without movement */
+#define DOOR_HOLD_MAX_MS        (10000U)  /* thermal: stop pushing a door that is kept open */
 
 DOOR_t door =
 {
@@ -42,6 +58,22 @@ DOOR_t door =
     .i_resist_max = 2.0f,
     .open_dir = +1,
     .wind_sign = +1,
+    .free_counts = 36,
+    .ramp_counts = 24,
+    .k_damp = 0.005f,
+    .buzz_amp = 0.6f,
+    .buzz_hz = 40.0f,
+    .buzz_ms = 200U,
+    .buzz_min_level = 0.5f,
+    .full_counts = 72,
+    .open_window_ms = 120U,
+    .hold_spring = 0U,
+    .close_cps_max = 60.0f,
+    .relent_delay_ms = 800U,
+    .relent_ms = 2500U,
+    .relent_floor = 0.3f,
+    .recover_ms = 1500U,
+    .strength = 1.0f,
 };
 
 /* Hall code (u | v << 1 | w << 2) -> sector 0..5 along the DB42M03 sequence.
@@ -49,18 +81,37 @@ DOOR_t door =
  * reverses the order, which open_dir absorbs. */
 static const int8_t hall_sector[8] = { -1, 4, 2, 3, 0, 5, 1, -1 };
 
+/* Written in SysTick */
 static int8_t sector_prev = -1;
 static int32_t last_count_dir = 0;
 static uint32_t last_count_ms = 0U;
+static uint32_t tick_count = 0U;
+static uint32_t last_count_tick = 0U;
+static float inst_cps = 0.0f;   /* speed from the last Hall edge interval */
+static float energy_j = 0.0f;   /* running total of work done against the motor while opening */
+static uint32_t ticks_in_ms = 0U;
+
+/* Main loop only */
 static uint32_t last_hb = 0U;
 static uint32_t last_hb_ms = 0U;
 static uint32_t state_since_ms = 0U;
 static int32_t pos_window_start = 0;
 static uint32_t window_start_ms = 0U;
 static uint32_t ms_prev = 0U;
-static uint32_t ticks_in_ms = 0U;
 static bool fault_mask_set = false;
 static uint32_t last_fault_clear_ms = 0U;
+static float i_base = 0.0f;     /* ramped current before the buzz is added */
+static uint32_t buzz_left_ms = 0U;
+static uint32_t buzz_start_ms = 0U;
+static uint32_t last_buzz_req = 0U;
+static uint32_t ev_start_ms = 0U;
+static float ev_start_energy = 0.0f;
+static float ev_peak_iq = 0.0f;
+static int32_t ev_max_dist = 0;
+static bool holding = false;
+static uint32_t hold_start_ms = 0U;
+static bool pushing = false;    /* the motor is resisting someone (resist past free travel, or holding) */
+static uint32_t push_start_ms = 0U;
 
 static uint32_t ReadHall(void)
 {
@@ -87,9 +138,17 @@ static void TrackHall(uint32_t now_ms)
         if (step == 1 || step == 5)
         {
             int32_t dir = (step == 1) ? +1 : -1;
+            uint32_t dt = tick_count - last_count_tick;
             door.pos += dir;
             last_count_dir = dir;
             last_count_ms = now_ms;
+            last_count_tick = tick_count;
+            inst_cps = (dt > 0U) ? (float)dir * (float)DOOR_TICK_HZ / (float)dt : 0.0f;
+            if (dir == ((door.open_dir >= 0) ? +1 : -1))
+            {
+                /* Work done against the motor over this step: measured torque times the step angle */
+                energy_j += DOOR_KT_NM_PER_A * fabsf(motor[0].vars_ptr->i_qd_r_fb.q) * DOOR_RAD_PER_COUNT;
+            }
         }
         else
         {
@@ -113,8 +172,68 @@ static float Clamp(float x, float lo, float hi)
     return (x < lo) ? lo : ((x > hi) ? hi : x);
 }
 
+static void StartBuzz(uint32_t now_ms)
+{
+    buzz_left_ms = MIN(door.buzz_ms, DOOR_BUZZ_MAX_MS);
+    buzz_start_ms = now_ms;
+}
+
+/* Speed from the interval between Hall edges reacts within one edge, unlike the
+ * 100 ms cps window. Between edges it can only be as fast as "one count since the
+ * last edge", so it decays to zero when the shaft stops. */
+static void UpdateSpeed(void)
+{
+    uint32_t since_ticks = tick_count - last_count_tick;
+    float v = inst_cps;
+    if (since_ticks >= (DOOR_TICK_HZ / 1000U) * DOOR_VEL_STOP_MS)
+    {
+        v = 0.0f;
+    }
+    else
+    {
+        float bound = (float)DOOR_TICK_HZ / (float)MAX(since_ticks, 1U);
+        v = Clamp(v, -bound, bound);
+    }
+    door.vel_cps += (v - door.vel_cps) / DOOR_VEL_TAU_MS;
+}
+
+/* One opening = from entering RESIST until the door is closed again or stays still */
+static void TrackOpening(uint32_t now_ms, float iq_abs)
+{
+    if (!door.ev_active && (door.state == DOOR_RESIST))
+    {
+        door.ev_active = 1U;
+        ev_start_ms = now_ms;
+        ev_start_energy = energy_j;
+        ev_peak_iq = 0.0f;
+        ev_max_dist = 0;
+    }
+    if (!door.ev_active)
+    {
+        return;
+    }
+    door.ev_energy_mj = (energy_j - ev_start_energy) * 1000.0f;
+    ev_peak_iq = MAX(ev_peak_iq, iq_abs);
+    ev_max_dist = MAX(ev_max_dist, door.open_dist);
+
+    bool closed = (door.open_dist <= 0) && ((now_ms - ev_start_ms) > 200U);
+    bool still = (now_ms - last_count_ms) > DOOR_EVENT_REST_MS;
+    if (closed || still || (door.state == DOOR_DISARMED))
+    {
+        door.last_energy_mj = door.ev_energy_mj;
+        door.last_peak_iq = ev_peak_iq;
+        door.last_max_dist = ev_max_dist;
+        door.last_duration_ms = now_ms - ev_start_ms;
+        door.last_gave_up = (ev_max_dist < door.full_counts) ? 1U : 0U;
+        door.ev_count++;
+        door.ev_active = 0U;
+    }
+}
+
 static void Control(uint32_t now_ms)
 {
+    CTRL_VARS_t *vars_ptr = motor[0].vars_ptr;
+
     if (door.host_hb != last_hb)
     {
         last_hb = door.host_hb;
@@ -128,13 +247,68 @@ static void Control(uint32_t now_ms)
         pos_window_start = door.pos;
         window_start_ms = now_ms;
     }
+    UpdateSpeed();
 
     int32_t open_dir = (door.open_dir >= 0) ? +1 : -1;
-    bool opening = (last_count_dir == open_dir) && ((now_ms - last_count_ms) < DOOR_OPEN_WINDOW_MS);
+    uint32_t open_window_ms = (door.open_window_ms > 0U) ? MIN(door.open_window_ms, 2000U) : DOOR_OPEN_WINDOW_MS;
+    bool opening = (last_count_dir == open_dir) && ((now_ms - last_count_ms) < open_window_ms);
     bool overspeed = ((door.cps * (float)open_dir) < -DOOR_OVERSPEED_CPS) || (fabsf(door.cps) > DOOR_RUNAWAY_CPS);
 
+    /* Distance opened, measured from the closed door. Take-up keeps the string wound
+     * while the door is shut, so the most-wound position is "closed"; after a few
+     * seconds at rest, wherever the door sits counts as closed too. */
+    bool at_rest = (now_ms - last_count_ms) > DOOR_REHOME_MS;
+    if (((door.pos - door.home_pos) * open_dir < 0) || (door.state == DOOR_DISARMED) ||
+        (at_rest && (door.state == DOOR_IDLE)))
+    {
+        door.home_pos = door.pos;
+    }
+    door.open_dist = (door.pos - door.home_pos) * open_dir;
+
+    /* Door closer: keep the spring while the door stays open, but let go while it
+     * swings shut fast (no slamming) and after DOOR_HOLD_MAX_MS (thermal) */
+    bool open_past_free = door.open_dist > door.free_counts;
+    if (open_past_free && !holding)
+    {
+        holding = true;
+        hold_start_ms = now_ms;
+    }
+    else if (!open_past_free)
+    {
+        holding = false;
+    }
+    float v_close = MAX(-door.vel_cps * (float)open_dir, 0.0f);
+    bool hold_on = (door.hold_spring != 0U) && holding && ((now_ms - hold_start_ms) < DOOR_HOLD_MAX_MS) &&
+                   (v_close < door.close_cps_max);
+
+    /* Give in like a person: a steady push against the motor wears its strength
+     * down after a moment, and it comes back once nobody pushes */
+    bool push_now = open_past_free && ((door.state == DOOR_RESIST) || hold_on);
+    if (push_now && !pushing)
+    {
+        push_start_ms = now_ms;
+    }
+    pushing = push_now;
+    float relent_floor = Clamp(door.relent_floor, 0.0f, 1.0f);
+    if (pushing && (door.relent_ms > 0U) && ((now_ms - push_start_ms) > door.relent_delay_ms))
+    {
+        door.strength = MAX(relent_floor, door.strength - (1.0f - relent_floor) / (float)door.relent_ms);
+    }
+    else if (!pushing)
+    {
+        door.strength = MIN(1.0f, door.strength + 1.0f / (float)MAX(door.recover_ms, 1U));
+    }
+
+    /* Free travel first, then a spring that builds up with distance, plus damping
+     * that grows with the opening speed. All scale with the level and the strength. */
+    float level = Clamp(door.level, 0.0f, 1.0f) * Clamp(door.strength, 0.0f, 1.0f);
+    float build = Clamp((float)(door.open_dist - door.free_counts) / (float)MAX(door.ramp_counts, 1), 0.0f, 1.0f);
+    float v_open = MAX(door.vel_cps * (float)open_dir, 0.0f);
     float i_take = Clamp(door.i_take, 0.0f, DOOR_I_LIMIT);
-    float i_resist = i_take + Clamp(door.level, 0.0f, 1.0f) * (Clamp(door.i_resist_max, 0.0f, DOOR_I_LIMIT) - i_take);
+    float i_spring = level * build * (Clamp(door.i_resist_max, 0.0f, DOOR_I_LIMIT) - i_take);
+    float i_damp = level * build * MAX(door.k_damp, 0.0f) * v_open;
+    float i_resist = i_take + i_spring + i_damp;
+    float i_hold = hold_on ? i_spring : 0.0f;
     float target = 0.0f;
 
     if (!host_ok)
@@ -153,7 +327,7 @@ static void Control(uint32_t now_ms)
         }
         break;
     case DOOR_IDLE:
-        target = i_take;
+        target = i_take + i_hold;
         if (overspeed)
         {
             SetState(DOOR_COOLDOWN, now_ms);
@@ -161,6 +335,10 @@ static void Control(uint32_t now_ms)
         else if (opening)
         {
             SetState(DOOR_RESIST, now_ms);
+            if (Clamp(door.level, 0.0f, 1.0f) >= door.buzz_min_level)
+            {
+                StartBuzz(now_ms); /* a warning shiver as the hand starts to open */
+            }
         }
         break;
     case DOOR_RESIST:
@@ -191,21 +369,48 @@ static void Control(uint32_t now_ms)
         break;
     }
 
-    /* Ramp up fast so resistance is felt at once, down slowly so a released door eases shut */
-    if (target > door.i_cmd)
+    /* The host can buzz on its own, e.g. when tasks are left */
+    if (door.buzz_req != last_buzz_req)
     {
-        door.i_cmd = MIN(target, door.i_cmd + DOOR_RAMP_UP_A_PER_MS);
+        last_buzz_req = door.buzz_req;
+        if ((door.state == DOOR_IDLE) || (door.state == DOOR_RESIST))
+        {
+            StartBuzz(now_ms);
+        }
+    }
+
+    /* Ramp only the base current: up gently so resistance comes on smoothly,
+     * down slowly so a released door eases shut */
+    if (target > i_base)
+    {
+        i_base = MIN(target, i_base + DOOR_RAMP_UP_A_PER_MS);
     }
     else
     {
-        door.i_cmd = MAX(target, door.i_cmd - DOOR_RAMP_DOWN_A_PER_MS);
+        i_base = MAX(target, i_base - DOOR_RAMP_DOWN_A_PER_MS);
     }
     if (door.state == DOOR_DISARMED)
     {
-        door.i_cmd = 0.0f;
+        i_base = 0.0f;
     }
 
-    CTRL_VARS_t *vars_ptr = motor[0].vars_ptr;
+    /* The buzz rides on top of the ramp (ramping it would smooth it away). The
+     * string cannot push, so only the tension wobbles: base + A * (0.5 + 0.5 sin). */
+    float out = i_base;
+    if ((door.state == DOOR_DISARMED) || (door.state == DOOR_COOLDOWN))
+    {
+        buzz_left_ms = 0U;
+    }
+    if (buzz_left_ms > 0U)
+    {
+        float t = (float)(now_ms - buzz_start_ms) * 0.001f;
+        float hz = Clamp(door.buzz_hz, 1.0f, DOOR_BUZZ_HZ_MAX);
+        out += Clamp(door.buzz_amp, 0.0f, DOOR_BUZZ_AMP_MAX) * (0.5f + 0.5f * sinf(6.2831853f * hz * t));
+        buzz_left_ms--;
+    }
+    door.buzz_left_ms = buzz_left_ms;
+    door.i_cmd = Clamp(out, 0.0f, DOOR_I_LIMIT);
+
     float i_max = motor[0].params_ptr->sys.cmd.i_max;
 
     /* Holding torque at standstill leaves one phase near zero current for as long as
@@ -235,12 +440,15 @@ static void Control(uint32_t now_ms)
     door.lib_state = (uint32_t)lib_state;
     door.lib_flags = ((lib_state == Current_CL) ? 1U : 0U) | ((lib_state == Fault) ? 2U : 0U);
     door.fault_sw = motor[0].faults_ptr->flags_latched.sw.reg;
+
+    TrackOpening(now_ms, fabsf(door.iq_fb));
 }
 
 /* Lowest priority, so it never delays the motor control ISRs, but it still
  * preempts the main loop and samples the Hall code even if the loop blocks. */
 void SysTick_Handler(void)
 {
+    tick_count++;
     if (++ticks_in_ms >= (DOOR_TICK_HZ / 1000U))
     {
         ticks_in_ms = 0U;
