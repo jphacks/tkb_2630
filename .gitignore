@@ -1,0 +1,8 @@
+# ModusToolbox shared libraries, restored with `make getlibs` in motor-fw/
+mtb_shared/
+
+# Python virtualenvs
+.venv/
+__pycache__/
+
+.DS_Store
