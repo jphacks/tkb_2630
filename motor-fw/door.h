@@ -81,7 +81,7 @@ typedef struct
      * (6 for a 90 degree swing) and can also push the door shut. */
     volatile uint32_t open_window_ms; /* an opening count newer than this keeps resisting */
     volatile uint32_t hold_spring;    /* 1: keep the spring force while the door is held open (door closer) */
-    volatile float close_cps_max;     /* holding lets go while the door swings shut faster than this */
+    volatile float close_cps_max;     /* swinging shut faster than this: stop resisting or holding at once */
 
     /* Written by the host: give in like a person. After resisting a steady pull for
      * relent_delay_ms, the strength eases off to relent_floor over relent_ms, and

@@ -52,7 +52,7 @@
 #define DOOR_BUZZ_MAX_MS        (1000U)
 #define DOOR_EVENT_REST_MS      (1500U)   /* an opening ends after this long without movement */
 #define DOOR_HOLD_MAX_MS        (10000U)  /* thermal: stop pushing a door that is kept open */
-#define DOOR_RESIST_STILL_MS    (1500U)   /* resisting a door held still ends after this */
+#define DOOR_GAVE_IN_STILL_MS   (1500U)   /* after giving in fully, still this long ends resisting */
 #define DOOR_RELENT_PARTIAL_MS  (1500U)   /* extra wait before giving in to a tug that stalls short of full strength */
 
 DOOR_t door =
@@ -362,23 +362,25 @@ static void Control(uint32_t now_ms)
         break;
     case DOOR_RESIST:
         /* Keep resisting while the hand holds the door against us, so a steady pull is
-         * a steady tug rather than catch-and-release. Stop as soon as the door has moved
-         * back release_counts from its furthest point (the hand let go: never pull it
-         * shut), or once it has been still a while. */
+         * a steady tug rather than catch-and-release. Stop as soon as the hand lets go,
+         * so we never pull the door shut: the door has moved back release_counts from its
+         * furthest point, or is swinging back faster than close_cps_max (a balanced tug
+         * only jitters slowly). A door that stays still while we resist is a hand holding
+         * it against us, so keep going: giving in, or DOOR_RESIST_MAX_MS, ends it. */
         target = MAX(i_resist, i_take);
         resist_peak = MAX(resist_peak, door.open_dist);
         if (overspeed)
         {
             SetState(DOOR_COOLDOWN, now_ms);
         }
-        else if (door.open_dist <= resist_peak - MAX(door.release_counts, 1))
+        else if ((door.open_dist <= resist_peak - MAX(door.release_counts, 1)) || (v_close > door.close_cps_max))
         {
             SetState(DOOR_IDLE, now_ms);
             i_base = MIN(i_base, i_take);
         }
-        else if (!opening && ((now_ms - last_count_ms) > DOOR_RESIST_STILL_MS))
+        else if ((door.strength <= relent_floor + 0.01f) && ((now_ms - last_count_ms) > DOOR_GAVE_IN_STILL_MS))
         {
-            SetState(DOOR_IDLE, now_ms);
+            SetState(DOOR_IDLE, now_ms); /* gave in and the door has settled: this opening is over */
         }
         else if ((now_ms - state_since_ms) > DOOR_RESIST_MAX_MS)
         {
