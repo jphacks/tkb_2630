@@ -1,0 +1,531 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>おあずけ冷蔵庫 シミュレーター</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1f; --muted: #6b6b70; --line: #d9d7d2;
+    --accent: #2f6fde; --warn: #d9480f; --ok: #2b8a3e; --box: #e9e6df; --door: #8a6d4b;
+    --string: #2f6fde; --hand: #d9480f; --motor: #343a40;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #151517; --panel: #1f1f22; --ink: #ececef; --muted: #9a9aa2; --line: #34343a;
+      --accent: #6aa0ff; --warn: #ff8a50; --ok: #5cc27a; --box: #2a2a2e; --door: #b08d63;
+      --string: #6aa0ff; --hand: #ff8a50; --motor: #c9ccd1;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Noto Sans JP", sans-serif; }
+  header { padding: 16px 16px 4px; }
+  header h1 { font-size: 18px; margin: 0; }
+  header p { margin: 4px 0 0; color: var(--muted); }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; padding: 12px 16px 24px; }
+  @media (max-width: 860px) { main { grid-template-columns: minmax(0, 1fr); } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  #scene { width: 100%; height: 420px; display: block; touch-action: none; cursor: grab; }
+  #plot { width: 100%; height: 150px; display: block; margin-top: 8px; }
+  .legend { display: flex; gap: 14px; color: var(--muted); font-size: 12px; margin-top: 4px; flex-wrap: wrap; }
+  .legend i { display: inline-block; width: 12px; height: 3px; vertical-align: middle; margin-right: 4px; }
+  h2 { font-size: 13px; margin: 14px 0 6px; color: var(--muted); font-weight: 600; }
+  h2:first-child { margin-top: 0; }
+  .seg { display: flex; gap: 6px; flex-wrap: wrap; }
+  .seg button { flex: 1 1 auto; border: 1px solid var(--line); background: transparent; color: var(--ink);
+    border-radius: 8px; padding: 6px 8px; font: inherit; cursor: pointer; }
+  .seg button.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+  .row label { flex: 0 0 120px; color: var(--muted); font-size: 12px; }
+  .row input[type=range] { flex: 1; }
+  .row output { flex: 0 0 56px; text-align: right; font-variant-numeric: tabular-nums; font-size: 12px; }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; font-variant-numeric: tabular-nums; }
+  .stats div span { display: block; color: var(--muted); font-size: 11px; }
+  .stats div b { font-size: 16px; }
+  .bar { height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; margin-top: 4px; }
+  .bar > div { height: 100%; background: var(--accent); width: 100%; }
+  #events { list-style: none; padding: 0; margin: 0; font-size: 13px; }
+  #events li { padding: 4px 0; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; }
+  #events li em { font-style: normal; color: var(--muted); }
+  .gave { color: var(--ok); } .opened { color: var(--warn); }
+  details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .note { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .state { display: inline-block; padding: 1px 8px; border-radius: 10px; background: var(--line); font-size: 12px; }
+  .state.RESIST { background: var(--warn); color: #fff; }
+  .state.COOLDOWN { background: var(--muted); color: #fff; }
+</style>
+</head>
+<body>
+<header>
+  <h1>おあずけ冷蔵庫 シミュレーター</h1>
+  <p>扉の取っ手をドラッグして開けてみてください。抵抗が強いほど、扉はカーソルから遅れてついてきます。制御は実機の <code>motor-fw/door.c</code> と同じ計算です。</p>
+</header>
+<main>
+  <section class="card">
+    <canvas id="scene"></canvas>
+    <canvas id="plot"></canvas>
+    <div class="legend">
+      <span><i style="background:var(--hand)"></i>手が引く力 [N]</span>
+      <span><i style="background:var(--string)"></i>モーターが逆らう力 [N]</span>
+      <span><i style="background:var(--ok)"></i>強さ s（粘り負けで下がる）</span>
+    </div>
+  </section>
+  <aside class="card">
+    <h2>取り付け方</h2>
+    <div class="seg" id="mount">
+      <button data-v="string" class="on">糸（冷蔵庫の模型）</button>
+      <button data-v="hinge">ヒンジ直結（小さな扉）</button>
+    </div>
+    <h2>やり残したタスク（Think）</h2>
+    <div class="seg" id="tasks">
+      <button data-v="0">0件</button><button data-v="1">1件</button>
+      <button data-v="2">2件</button><button data-v="3" class="on">3件以上</button>
+    </div>
+    <div class="note" id="levelNote"></div>
+    <h2>時間帯の手触り</h2>
+    <div class="seg" id="profile">
+      <button data-v="day">昼（軽いバネ）</button><button data-v="night" class="on">夜（重い＋粘り＋ブルッ）</button>
+    </div>
+    <h2>自動で引く（デモ用）</h2>
+    <div class="row"><label>一定の力で引く</label><input type="range" id="autoF" min="0" max="30" step="1" value="0"><output id="autoFo">オフ</output></div>
+
+    <h2>いまの状態</h2>
+    <div class="stats">
+      <div><span>状態</span><b><span id="st" class="state">IDLE</span></b></div>
+      <div><span>開いた角度</span><b id="ang">0°</b></div>
+      <div><span>モーター電流</span><b id="cur">0.00 A</b></div>
+      <div><span>逆らう力（取っ手）</span><b id="fm">0.0 N</b></div>
+      <div><span>手が引く力</span><b id="fh">0.0 N</b></div>
+      <div><span>この回のエネルギー</span><b id="en">-</b></div>
+    </div>
+    <div class="row" style="margin-top:8px"><label>強さ s</label><div style="flex:1"><div class="bar"><div id="sbar"></div></div></div><output id="so">1.00</output></div>
+
+    <h2>開けた記録（欲求エネルギー）</h2>
+    <ul id="events"><li><em>まだありません</em></li></ul>
+
+    <details>
+      <summary>細かい設定（実機の host/mounts/*.json と同じ項目）</summary>
+      <div id="params"></div>
+    </details>
+    <div class="note" id="srcNote"></div>
+  </aside>
+</main>
+<script>
+"use strict";
+
+/* ---- Settings: mirrors host/mounts/*.json. When served over http these are
+ *      replaced by the real files, so the two never drift. ---- */
+const MOUNTS = {
+  string: {
+    // Door of a fridge mock: handle 35 cm from the hinge, string tied 31 cm out,
+    // wound on ~8 mm radius (thick cord on the 5 mm shaft).
+    geom: { name: "string", W: 0.35, attach: 0.31, spool: 0.008, J: 0.04, b: 0.15, maxDeg: 110 },
+    settings: { take: 0.2, max: 2.0, free: 36, ramp: 24, damp: 0.005, full: 72, window: 120, hold: 0,
+      closecps: 60, buzzamp: 0.6, buzzhz: 40, buzzms: 200, buzzlevel: 0.5, relentdelay: 1000,
+      relent: 2000, floor: 0.0, recover: 1500, release: 3 },
+    profiles: { day: { level: 0.4, max: 1.5, damp: 0.0, buzzlevel: 1.1 },
+      night: { level: 1.0, max: 2.5, damp: 0.01, buzzlevel: 0.5 } },
+  },
+  hinge: {
+    // Shaft fixed to a small cardboard door: handle 8 cm from the hinge.
+    geom: { name: "hinge", W: 0.08, attach: 0, spool: 0, J: 0.0015, b: 0.004, maxDeg: 110 },
+    settings: { take: 0.2, max: 3.0, free: 0, ramp: 2, damp: 0.1, full: 5, window: 400, hold: 1,
+      closecps: 20, buzzamp: 0.8, buzzhz: 40, buzzms: 200, buzzlevel: 0.5, relentdelay: 1000,
+      relent: 2000, floor: 0.0, recover: 1500, release: 1 },
+    profiles: { day: { level: 0.4, max: 2.0, damp: 0.0, buzzlevel: 1.1 },
+      night: { level: 1.0, max: 3.0, damp: 0.2, buzzlevel: 0.5 } },
+  },
+};
+// Same table as host/fridge.py: tasks left -> level
+const LEVELS = [0.0, 0.25, 0.5, 1.0];
+
+/* ---- Constants from motor-fw/door.c ---- */
+const KT = 0.036;                      // N*m/A, Nanotec DB42M03
+const RAD_PER_COUNT = 2 * Math.PI / 24;
+const K = { I_LIMIT: 3.0, RESIST_MAX_MS: 10000, COOLDOWN_MS: 3000, OVERSPEED_CPS: 400, RUNAWAY_CPS: 1500,
+  RAMP_UP: 0.02, RAMP_DOWN: 0.02, CPS_WINDOW_MS: 100, REHOME_MS: 3000, VEL_TAU_MS: 20, VEL_STOP_MS: 200,
+  BUZZ_AMP_MAX: 1.0, BUZZ_HZ_MAX: 100, BUZZ_MAX_MS: 1000, EVENT_REST_MS: 1500, HOLD_MAX_MS: 10000,
+  RESIST_STILL_MS: 1500, RELENT_PARTIAL_MS: 1500 };
+
+const clamp = (x, lo, hi) => Math.min(Math.max(x, lo), hi);
+
+let mountName = "string", tasksLeft = 3, profileName = "night";
+let P = {};      // active settings (the host's settings dict)
+let G = {};      // door geometry
+let fw, phys, hand;
+
+function applySettings() {
+  const m = MOUNTS[mountName];
+  G = m.geom;
+  P = Object.assign({}, m.settings, m.profiles[profileName]);
+  P.level = LEVELS[Math.min(tasksLeft, 3)] * (m.profiles[profileName].level ?? 1);
+  renderParams();
+  document.getElementById("levelNote").textContent =
+    `level = ${LEVELS[Math.min(tasksLeft, 3)]}（タスク）× ${m.profiles[profileName].level}（時間帯）= ${P.level.toFixed(2)}`;
+}
+
+/* ---- Firmware state (door.c) ---- */
+function resetFirmware() {
+  fw = { state: "IDLE", stateSince: 0, pos: 0, lastDir: 0, lastCountMs: -1e9, instCps: 0, vel: 0, cps: 0,
+    posWin: 0, winStart: 0, home: 0, openDist: 0, holding: false, holdStart: 0, engagedMs: 0, fullMs: 0,
+    strength: 1, iBase: 0, buzzLeft: 0, buzzStart: 0, evActive: false, evStart: 0, evStartE: 0, evPeak: 0,
+    evMax: 0, energyJ: 0, iCmd: 0, evEnergyMj: 0, resistPeak: 0 };
+}
+function setState(s, now) { if (fw.state !== s) { fw.state = s; fw.stateSince = now; } }
+
+// Called on every Hall edge, like TrackHall() in SysTick
+function onCount(dir, now, iq) {
+  const dt = now - fw.lastCountMs;
+  fw.pos += dir;
+  fw.lastDir = dir;
+  fw.lastCountMs = now;
+  fw.instCps = dt > 0 ? dir * 1000 / dt : 0;
+  if (dir === +1) fw.energyJ += KT * Math.abs(iq) * RAD_PER_COUNT;   // open_dir = +1 here
+}
+
+function control(now) {
+  const openDir = +1;
+  if (now - fw.winStart >= K.CPS_WINDOW_MS) {
+    fw.cps = (fw.pos - fw.posWin) * 1000 / (now - fw.winStart);
+    fw.posWin = fw.pos; fw.winStart = now;
+  }
+  // UpdateSpeed
+  const since = now - fw.lastCountMs;
+  let v = since >= K.VEL_STOP_MS ? 0 : clamp(fw.instCps, -1000 / Math.max(since, 0.1), 1000 / Math.max(since, 0.1));
+  fw.vel += (v - fw.vel) / K.VEL_TAU_MS;
+
+  const win = P.window > 0 ? Math.min(P.window, 2000) : 120;
+  const opening = fw.lastDir === openDir && since < win;
+  const overspeed = fw.cps * openDir < -K.OVERSPEED_CPS || Math.abs(fw.cps) > K.RUNAWAY_CPS;
+
+  const atRest = since > K.REHOME_MS;
+  if ((fw.pos - fw.home) * openDir < 0 || (atRest && fw.state === "IDLE")) fw.home = fw.pos;
+  fw.openDist = (fw.pos - fw.home) * openDir;
+
+  const openPastFree = fw.openDist > P.free;
+  if (openPastFree && !fw.holding) { fw.holding = true; fw.holdStart = now; }
+  else if (!openPastFree) fw.holding = false;
+  const vClose = Math.max(-fw.vel * openDir, 0);
+  const holdOn = P.hold !== 0 && fw.holding && now - fw.holdStart < K.HOLD_MAX_MS && vClose < P.closecps;
+
+  const build = clamp((fw.openDist - P.free) / Math.max(P.ramp, 1), 0, 1);
+
+  const engaged = openPastFree && (fw.state === "RESIST" || holdOn);
+  const floor = clamp(P.floor, 0, 1);
+  if (!fw.evActive && !engaged) {
+    fw.engagedMs = 0; fw.fullMs = 0;
+    fw.strength = Math.min(1, fw.strength + 1 / Math.max(P.recover, 1));
+  } else if (engaged) {
+    fw.engagedMs++;
+    if (build >= 1) fw.fullMs++;
+    const held = fw.fullMs > P.relentdelay || fw.engagedMs > P.relentdelay + K.RELENT_PARTIAL_MS;
+    if (held && P.relent > 0) fw.strength = Math.max(floor, fw.strength - (1 - floor) / P.relent);
+  }
+
+  const level = clamp(P.level, 0, 1) * clamp(fw.strength, 0, 1);
+  const vOpen = Math.max(fw.vel * openDir, 0);
+  const iTake = clamp(P.take, 0, K.I_LIMIT);
+  const iSpring = level * build * (clamp(P.max, 0, K.I_LIMIT) - iTake);
+  const iDamp = level * build * Math.max(P.damp, 0) * vOpen;
+  const iResist = iTake + iSpring + iDamp;
+  const iHold = holdOn ? iSpring : 0;
+  let target = 0;
+
+  switch (fw.state) {
+    case "IDLE":
+      target = iTake + iHold;
+      if (overspeed) setState("COOLDOWN", now);
+      else if (opening) {
+        setState("RESIST", now);
+        fw.resistPeak = fw.openDist;
+        if (clamp(P.level, 0, 1) >= P.buzzlevel) { fw.buzzLeft = Math.min(P.buzzms, K.BUZZ_MAX_MS); fw.buzzStart = now; }
+      }
+      break;
+    case "RESIST":
+      target = Math.max(iResist, iTake);
+      fw.resistPeak = Math.max(fw.resistPeak, fw.openDist);
+      if (overspeed) setState("COOLDOWN", now);
+      else if (fw.openDist <= fw.resistPeak - Math.max(P.release, 1)) { setState("IDLE", now); fw.iBase = Math.min(fw.iBase, iTake); }
+      else if (!opening && since > K.RESIST_STILL_MS) setState("IDLE", now);
+      else if (now - fw.stateSince > K.RESIST_MAX_MS) setState("COOLDOWN", now);
+      break;
+    case "COOLDOWN":
+      target = overspeed ? 0 : iTake;
+      if (overspeed) fw.stateSince = now;
+      else if (now - fw.stateSince > K.COOLDOWN_MS) setState("IDLE", now);
+      break;
+  }
+
+  fw.iBase = target > fw.iBase ? Math.min(target, fw.iBase + K.RAMP_UP) : Math.max(target, fw.iBase - K.RAMP_DOWN);
+  let out = fw.iBase;
+  if (fw.state === "COOLDOWN") fw.buzzLeft = 0;
+  fw.buzz = 0;
+  if (fw.buzzLeft > 0) {
+    const t = (now - fw.buzzStart) * 0.001;
+    fw.buzz = clamp(P.buzzamp, 0, K.BUZZ_AMP_MAX) * (0.5 + 0.5 * Math.sin(2 * Math.PI * clamp(P.buzzhz, 1, K.BUZZ_HZ_MAX) * t));
+    out += fw.buzz;
+    fw.buzzLeft--;
+  }
+  fw.iCmd = clamp(out, 0, K.I_LIMIT);
+
+  trackOpening(now);
+}
+
+// TrackOpening(): one opening = from RESIST until closed again or left alone
+function trackOpening(now) {
+  if (!fw.evActive && fw.state === "RESIST") {
+    Object.assign(fw, { evActive: true, evStart: now, evStartE: fw.energyJ, evPeak: 0, evMax: 0 });
+  }
+  if (!fw.evActive) return;
+  fw.evEnergyMj = (fw.energyJ - fw.evStartE) * 1000;
+  fw.evPeak = Math.max(fw.evPeak, fw.iCmd);
+  fw.evMax = Math.max(fw.evMax, fw.openDist);
+  const closed = fw.openDist <= 0 && now - fw.evStart > 200;
+  const still = now - fw.lastCountMs > K.EVENT_REST_MS && fw.state !== "RESIST";
+  if (closed || still) {
+    fw.evActive = false;
+    addEvent({ mj: fw.evEnergyMj, peak: fw.evPeak, dist: fw.evMax, ms: now - fw.evStart, gaveUp: fw.evMax < P.full });
+  }
+}
+
+/* ---- Door physics ---- */
+function resetPhysics() {
+  phys = { t: 0, theta: 0, omega: 0, phiCount: 0, tauHand: 0, tauMotor: 0 };
+  hand = { dragging: false, target: 0 };
+}
+function motorAngle(theta) {
+  // string: string pulled out = attach radius * theta, wound on the spool; hinge: shaft turns with the door
+  return G.name === "string" ? G.attach * theta / G.spool : theta;
+}
+function motorTorqueOnDoor(i) {
+  // closing torque at the hinge from the winding current
+  return -(G.name === "string" ? KT * i * G.attach / G.spool : KT * i);
+}
+function step1ms() {
+  const dt = 0.001, now = ++phys.t;
+  const autoF = +document.getElementById("autoF").value;
+  const Kh = G.name === "string" ? 25 : 1.2, Dh = G.name === "string" ? 0.8 : 0.03;  // the hand as a spring to the cursor
+  const tauMax = 40 * G.W;                                                            // a hand pulls at most ~40 N
+  let tauHand = 0;
+  if (hand.dragging) tauHand = clamp(Kh * (hand.target - phys.theta) - Dh * phys.omega, -tauMax, tauMax);
+  // a hand cannot keep its force at speed: it fades to nothing at ~0.8 m/s at the handle
+  else if (autoF > 0) tauHand = autoF * G.W * clamp(1 - phys.omega * G.W / 0.8, 0, 1);
+  const tauMotor = motorTorqueOnDoor(fw.iCmd);
+  const alpha = (tauHand + tauMotor - G.b * phys.omega) / G.J;
+  phys.omega += alpha * dt;
+  phys.theta += phys.omega * dt;
+  const maxRad = G.maxDeg * Math.PI / 180;
+  if (phys.theta < 0) { phys.theta = 0; phys.omega = Math.max(phys.omega, 0); }
+  if (phys.theta > maxRad) { phys.theta = maxRad; phys.omega = Math.min(phys.omega, 0); }
+  phys.tauHand = tauHand; phys.tauMotor = tauMotor;
+
+  // Hall edges from the motor shaft angle
+  const count = Math.floor(motorAngle(phys.theta) / RAD_PER_COUNT);
+  while (count !== phys.phiCount) {
+    const dir = count > phys.phiCount ? 1 : -1;
+    phys.phiCount += dir;
+    onCount(dir, now, fw.iCmd);
+  }
+  control(now);
+}
+
+/* ---- Events list ---- */
+const events = [];
+function addEvent(e) {
+  events.unshift(e);
+  events.length = Math.min(events.length, 6);
+  const ul = document.getElementById("events");
+  ul.innerHTML = events.map(ev =>
+    `<li><span>${(ev.mj / 1000).toFixed(2)} J <em>最大 ${ev.peak.toFixed(1)} A・${(ev.ms / 1000).toFixed(1)} 秒</em></span>` +
+    `<span class="${ev.gaveUp ? "gave" : "opened"}">${ev.gaveUp ? "あきらめた" : "開けた"}</span></li>`).join("");
+}
+
+/* ---- Drawing ---- */
+const scene = document.getElementById("scene"), plot = document.getElementById("plot");
+const sctx = scene.getContext("2d"), pctx = plot.getContext("2d");
+const history = [];
+function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+function fitCanvas(c) {
+  const r = c.getBoundingClientRect(), d = window.devicePixelRatio || 1;
+  if (c.width !== Math.round(r.width * d) || c.height !== Math.round(r.height * d)) {
+    c.width = Math.round(r.width * d); c.height = Math.round(r.height * d);
+  }
+  return { w: c.width, h: c.height, d };
+}
+function sceneLayout() {
+  const { w, h, d } = fitCanvas(scene);
+  const L = Math.min(w * 0.55, h * 0.75);       // door length on screen
+  return { w, h, d, L, hx: w * 0.5 - L * 0.5, hy: h * 0.32 };
+}
+function drawScene() {
+  const { w, h, d, L, hx, hy } = sceneLayout();
+  sctx.clearRect(0, 0, w, h);
+  // fridge body (top-down), front edge along the closed door
+  sctx.fillStyle = css("--box");
+  sctx.fillRect(hx, hy - L * 0.55, L, L * 0.55);
+  sctx.strokeStyle = css("--line"); sctx.lineWidth = 2 * d;
+  sctx.strokeRect(hx, hy - L * 0.55, L, L * 0.55);
+  sctx.fillStyle = css("--muted"); sctx.font = `${12 * d}px sans-serif`;
+  sctx.fillText(G.name === "string" ? "冷蔵庫（上から見た図）" : "箱（上から見た図）", hx + 8 * d, hy - L * 0.55 + 18 * d);
+
+  const shake = (fw.buzz || 0) * 6 * d;
+  const th = phys.theta;
+  const ex = hx + Math.cos(th) * L, ey = hy + Math.sin(th) * L;
+  const nx = -Math.sin(th), ny = Math.cos(th);
+  const sx = nx * shake * Math.sin(phys.t), sy = ny * shake * Math.sin(phys.t);
+
+  // motor and string
+  sctx.fillStyle = css("--motor");
+  if (G.name === "string") {
+    const mx = hx + L * 0.88, my = hy - L * 0.3;
+    sctx.fillRect(mx - 12 * d, my - 12 * d, 24 * d, 24 * d);
+    const ax = hx + Math.cos(th) * L * (G.attach / G.W), ay = hy + Math.sin(th) * L * (G.attach / G.W);
+    sctx.strokeStyle = css("--string"); sctx.lineWidth = (1.5 + fw.iCmd) * d;
+    sctx.beginPath(); sctx.moveTo(mx, my); sctx.lineTo(ax + sx, ay + sy); sctx.stroke();
+    sctx.fillStyle = css("--muted");
+    sctx.fillText("モーター", mx - 20 * d, my - 18 * d);
+  } else {
+    sctx.beginPath(); sctx.arc(hx, hy, 14 * d, 0, 2 * Math.PI); sctx.fill();
+    sctx.fillStyle = css("--muted");
+    sctx.fillText("モーター（軸＝ヒンジ）", hx - 40 * d, hy - 20 * d);
+  }
+  // door
+  sctx.strokeStyle = css("--door"); sctx.lineWidth = 8 * d; sctx.lineCap = "round";
+  sctx.beginPath(); sctx.moveTo(hx + sx, hy + sy); sctx.lineTo(ex + sx, ey + sy); sctx.stroke();
+  // handle
+  sctx.fillStyle = css("--ink");
+  sctx.beginPath(); sctx.arc(ex + sx, ey + sy, 7 * d, 0, 2 * Math.PI); sctx.fill();
+  // hand rubber band
+  if (hand.dragging && hand.px != null) {
+    sctx.strokeStyle = css("--hand"); sctx.lineWidth = 2 * d; sctx.setLineDash([6 * d, 4 * d]);
+    sctx.beginPath(); sctx.moveTo(ex, ey); sctx.lineTo(hand.px * d, hand.py * d); sctx.stroke();
+    sctx.setLineDash([]);
+  }
+  // resisting force arrow at the handle
+  const fm = -phys.tauMotor / G.W;
+  if (fm > 0.05) {
+    const len = Math.min(fm * 6, 120) * d;
+    const tx = -nx, ty = -ny;   // toward closing
+    sctx.strokeStyle = css("--string"); sctx.lineWidth = 3 * d;
+    sctx.beginPath(); sctx.moveTo(ex, ey); sctx.lineTo(ex + tx * len, ey + ty * len); sctx.stroke();
+  }
+  if (fw.buzz > 0) { sctx.fillStyle = css("--warn"); sctx.fillText("ブルッ", ex + 12 * d, ey + 20 * d); }
+  sctx.fillStyle = css("--muted");
+  sctx.fillText("取っ手をドラッグして開ける", 12 * d, h - 12 * d);
+}
+function drawPlot() {
+  const { w, h, d } = fitCanvas(plot);
+  pctx.clearRect(0, 0, w, h);
+  pctx.strokeStyle = css("--line"); pctx.lineWidth = 1 * d;
+  pctx.strokeRect(0.5, 0.5, w - 1, h - 1);
+  const fMax = Math.max(10, ...history.map(s => Math.max(s.fh, s.fm)));
+  const line = (key, color, scale) => {
+    pctx.strokeStyle = color; pctx.lineWidth = 2 * d; pctx.beginPath();
+    history.forEach((s, i) => {
+      const x = i / 400 * w, y = h - 4 * d - (s[key] / scale) * (h - 8 * d);
+      i ? pctx.lineTo(x, y) : pctx.moveTo(x, y);
+    });
+    pctx.stroke();
+  };
+  line("fh", css("--hand"), fMax);
+  line("fm", css("--string"), fMax);
+  line("s", css("--ok"), 1);
+  pctx.fillStyle = css("--muted"); pctx.font = `${11 * d}px sans-serif`;
+  pctx.fillText(`${fMax.toFixed(0)} N`, 6 * d, 14 * d);
+  pctx.fillText("過去8秒", w - 52 * d, 14 * d);
+}
+function updateStats() {
+  const st = document.getElementById("st");
+  st.textContent = fw.state; st.className = "state " + fw.state;
+  document.getElementById("ang").textContent = `${(phys.theta * 180 / Math.PI).toFixed(0)}°`;
+  document.getElementById("cur").textContent = `${fw.iCmd.toFixed(2)} A`;
+  document.getElementById("fm").textContent = `${(-phys.tauMotor / G.W).toFixed(1)} N`;
+  document.getElementById("fh").textContent = `${(phys.tauHand / G.W).toFixed(1)} N`;
+  document.getElementById("en").textContent = fw.evActive ? `${(fw.evEnergyMj / 1000).toFixed(2)} J` : "-";
+  document.getElementById("so").textContent = fw.strength.toFixed(2);
+  document.getElementById("sbar").style.width = `${fw.strength * 100}%`;
+}
+
+/* ---- Interaction ---- */
+function pointerAngle(ev) {
+  const r = scene.getBoundingClientRect(), { d, hx, hy } = sceneLayout();
+  hand.px = ev.clientX - r.left; hand.py = ev.clientY - r.top;
+  const a = Math.atan2(hand.py * d - hy, hand.px * d - hx);
+  return clamp(a, 0, G.maxDeg * Math.PI / 180);
+}
+scene.addEventListener("pointerdown", ev => { hand.dragging = true; hand.target = pointerAngle(ev); scene.setPointerCapture(ev.pointerId); scene.style.cursor = "grabbing"; });
+scene.addEventListener("pointermove", ev => { if (hand.dragging) hand.target = pointerAngle(ev); });
+const release = () => { hand.dragging = false; scene.style.cursor = "grab"; };
+scene.addEventListener("pointerup", release);
+scene.addEventListener("pointercancel", release);
+
+function segment(id, onPick) {
+  document.getElementById(id).addEventListener("click", ev => {
+    const b = ev.target.closest("button"); if (!b) return;
+    [...ev.currentTarget.children].forEach(x => x.classList.toggle("on", x === b));
+    onPick(b.dataset.v);
+  });
+}
+segment("mount", v => { mountName = v; applySettings(); resetPhysics(); resetFirmware(); });
+segment("tasks", v => { tasksLeft = +v; applySettings(); });
+segment("profile", v => { profileName = v; applySettings(); });
+document.getElementById("autoF").addEventListener("input", ev =>
+  document.getElementById("autoFo").textContent = +ev.target.value ? `${ev.target.value} N` : "オフ");
+
+const PARAM_UI = [
+  ["max", "最大電流 [A]", 0, 3, 0.1], ["free", "遊び [カウント]", 0, 120, 1], ["ramp", "重くなる距離", 1, 120, 1],
+  ["damp", "粘り [A/(cnt/s)]", 0, 0.3, 0.001], ["relentdelay", "最大を保つ [ms]", 0, 5000, 100],
+  ["relent", "負けるまで [ms]", 0, 8000, 100], ["floor", "負けた後の強さ", 0, 1, 0.05], ["buzzamp", "ブルッの強さ [A]", 0, 1, 0.05],
+];
+function renderParams() {
+  document.getElementById("params").innerHTML = PARAM_UI.map(([k, label, lo, hi, st]) =>
+    `<div class="row"><label>${label}</label><input type="range" data-k="${k}" min="${lo}" max="${hi}" step="${st}" value="${P[k]}"><output>${P[k]}</output></div>`).join("");
+}
+document.getElementById("params").addEventListener("input", ev => {
+  const k = ev.target.dataset.k; if (!k) return;
+  P[k] = +ev.target.value; ev.target.nextElementSibling.textContent = ev.target.value;
+});
+
+/* ---- Main loop: 1 ms physics + control steps, real time ---- */
+let last = performance.now();
+function frame(t) {
+  const steps = Math.min(Math.round(t - last), 50);
+  last += steps;
+  for (let i = 0; i < steps; i++) {
+    step1ms();
+    if (phys.t % 20 === 0) {
+      history.push({ fh: Math.max(phys.tauHand / G.W, 0), fm: Math.max(-phys.tauMotor / G.W, 0), s: fw.strength });
+      if (history.length > 400) history.shift();
+    }
+  }
+  drawScene(); drawPlot(); updateStats();
+  requestAnimationFrame(frame);
+}
+
+async function loadMountFiles() {
+  if (!location.protocol.startsWith("http")) {
+    document.getElementById("srcNote").textContent = "設定：内蔵の初期値（host/sim/serve.sh で開くと host/mounts/*.json を読み込みます）";
+    return;
+  }
+  try {
+    for (const name of Object.keys(MOUNTS)) {
+      const r = await fetch(`../mounts/${name}.json`);
+      if (!r.ok) throw new Error(r.status);
+      const j = await r.json();
+      Object.assign(MOUNTS[name].settings, j.settings);
+      Object.assign(MOUNTS[name].profiles, j.profiles);
+    }
+    document.getElementById("srcNote").textContent = "設定：host/mounts/*.json から読み込みました（実機と同じ値）";
+  } catch (e) {
+    document.getElementById("srcNote").textContent = `設定：内蔵の初期値（mounts の読み込みに失敗：${e.message}）`;
+  }
+}
+
+loadMountFiles().then(() => {
+  applySettings(); resetPhysics(); resetFirmware();
+  requestAnimationFrame(t => { last = t; requestAnimationFrame(frame); });
+});
+</script>
+</body>
+</html>
