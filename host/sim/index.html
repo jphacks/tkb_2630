@@ -120,7 +120,7 @@ const MOUNTS = {
   string: {
     // Door of a fridge mock: handle 35 cm from the hinge, string tied 31 cm out,
     // wound on ~8 mm radius (thick cord on the 5 mm shaft).
-    geom: { name: "string", W: 0.35, attach: 0.31, spool: 0.008, J: 0.04, b: 0.15, maxDeg: 110 },
+    geom: { name: "string", W: 0.35, attach: 0.31, spool: 0.008, J: 0.04, b: 0.15, stick: 0.5, slide: 0.4, maxDeg: 110 },
     settings: { take: 0.2, max: 2.0, free: 36, ramp: 24, damp: 0.005, full: 72, window: 120, hold: 0,
       closecps: 60, buzzamp: 0.6, buzzhz: 40, buzzms: 200, buzzlevel: 0.5, relentdelay: 1000,
       relent: 2000, floor: 0.0, recover: 1500, release: 3 },
@@ -129,8 +129,8 @@ const MOUNTS = {
   },
   hinge: {
     // Shaft fixed to a small cardboard door: handle 8 cm from the hinge.
-    geom: { name: "hinge", W: 0.08, attach: 0, spool: 0, J: 0.0015, b: 0.004, maxDeg: 110 },
-    settings: { take: 0.2, max: 3.0, free: 0, ramp: 2, damp: 0.1, full: 5, window: 400, hold: 1,
+    geom: { name: "hinge", W: 0.08, attach: 0, spool: 0, J: 0.0015, b: 0.004, stick: 0.02, slide: 0.012, maxDeg: 110 },
+    settings: { take: 0.2, max: 3.0, free: 0, ramp: 2, damp: 0.1, full: 5, window: 400, hold: 0,
       closecps: 20, buzzamp: 0.8, buzzhz: 40, buzzms: 200, buzzlevel: 0.5, relentdelay: 1000,
       relent: 2000, floor: 0.0, recover: 1500, release: 1 },
     profiles: { day: { level: 0.4, max: 2.0, damp: 0.0, buzzlevel: 1.1 },
@@ -146,9 +146,11 @@ const RAD_PER_COUNT = 2 * Math.PI / 24;
 const K = { I_LIMIT: 3.0, RESIST_MAX_MS: 10000, COOLDOWN_MS: 3000, OVERSPEED_CPS: 400, RUNAWAY_CPS: 1500,
   RAMP_UP: 0.02, RAMP_DOWN: 0.02, CPS_WINDOW_MS: 100, REHOME_MS: 3000, VEL_TAU_MS: 20, VEL_STOP_MS: 200,
   BUZZ_AMP_MAX: 1.0, BUZZ_HZ_MAX: 100, BUZZ_MAX_MS: 1000, EVENT_REST_MS: 1500, HOLD_MAX_MS: 10000,
-  RESIST_STILL_MS: 1500, RELENT_PARTIAL_MS: 1500 };
+  RELENT_PARTIAL_MS: 1500, GAVE_IN_STILL_MS: 1500 };
 
 const clamp = (x, lo, hi) => Math.min(Math.max(x, lo), hi);
+const SELF_CLOSE_MS = 60000;               // a door left open for a minute closes by itself
+const SELF_CLOSE_RAD_S = 30 * Math.PI / 180;
 
 let mountName = "string", tasksLeft = 3, profileName = "night";
 let P = {};      // active settings (the host's settings dict)
@@ -246,8 +248,8 @@ function control(now) {
       target = Math.max(iResist, iTake);
       fw.resistPeak = Math.max(fw.resistPeak, fw.openDist);
       if (overspeed) setState("COOLDOWN", now);
-      else if (fw.openDist <= fw.resistPeak - Math.max(P.release, 1)) { setState("IDLE", now); fw.iBase = Math.min(fw.iBase, iTake); }
-      else if (!opening && since > K.RESIST_STILL_MS) setState("IDLE", now);
+      else if (fw.openDist <= fw.resistPeak - Math.max(P.release, 1) || vClose > P.closecps) { setState("IDLE", now); fw.iBase = Math.min(fw.iBase, iTake); }
+      else if (fw.strength <= floor + 0.01 && since > K.GAVE_IN_STILL_MS) setState("IDLE", now);
       else if (now - fw.stateSince > K.RESIST_MAX_MS) setState("COOLDOWN", now);
       break;
     case "COOLDOWN":
@@ -291,7 +293,7 @@ function trackOpening(now) {
 
 /* ---- Door physics ---- */
 function resetPhysics() {
-  phys = { t: 0, theta: 0, omega: 0, phiCount: 0, tauHand: 0, tauMotor: 0 };
+  phys = { t: 0, theta: 0, omega: 0, phiCount: 0, tauHand: 0, tauMotor: 0, aloneMs: 0, selfClosing: false };
   hand = { dragging: false, target: 0 };
 }
 function motorAngle(theta) {
@@ -312,8 +314,22 @@ function step1ms() {
   // a hand cannot keep its force at speed: it fades to nothing at ~0.8 m/s at the handle
   else if (autoF > 0) tauHand = autoF * G.W * clamp(1 - phys.omega * G.W / 0.8, 0, 1);
   const tauMotor = motorTorqueOnDoor(fw.iCmd);
-  const alpha = (tauHand + tauMotor - G.b * phys.omega) / G.J;
-  phys.omega += alpha * dt;
+  // Door friction: it stays put until pushed past `stick` [N*m] (so the weak take-up
+  // only keeps the string taut and never swings the door shut), then drags with `slide`.
+  const drive = tauHand + tauMotor;
+  if (Math.abs(phys.omega) < 1e-3 && Math.abs(drive) <= G.stick) {
+    phys.omega = 0;
+  } else {
+    const dir = Math.abs(phys.omega) >= 1e-3 ? Math.sign(phys.omega) : Math.sign(drive);
+    const alpha = (drive - G.slide * dir - G.b * phys.omega) / G.J;
+    const omega = phys.omega + alpha * dt;
+    phys.omega = (phys.omega !== 0 && Math.sign(omega) !== Math.sign(phys.omega)) ? 0 : omega;  // friction stops, never reverses
+  }
+  // Left alone for SELF_CLOSE_MS with the door open, it swings shut by itself, the
+  // way a fridge door settles back: slowly, and not driven by the motor.
+  phys.aloneMs = tauHand !== 0 ? 0 : phys.aloneMs + 1;
+  phys.selfClosing = phys.aloneMs >= SELF_CLOSE_MS && phys.theta > 0;
+  if (phys.selfClosing) phys.omega = -SELF_CLOSE_RAD_S;
   phys.theta += phys.omega * dt;
   const maxRad = G.maxDeg * Math.PI / 180;
   if (phys.theta < 0) { phys.theta = 0; phys.omega = Math.max(phys.omega, 0); }
@@ -345,6 +361,7 @@ function addEvent(e) {
 const scene = document.getElementById("scene"), plot = document.getElementById("plot");
 const sctx = scene.getContext("2d"), pctx = plot.getContext("2d");
 const history = [];
+let buzzFlip = 1;
 function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
 function fitCanvas(c) {
   const r = c.getBoundingClientRect(), d = window.devicePixelRatio || 1;
@@ -369,11 +386,14 @@ function drawScene() {
   sctx.fillStyle = css("--muted"); sctx.font = `${12 * d}px sans-serif`;
   sctx.fillText(G.name === "string" ? "冷蔵庫（上から見た図）" : "箱（上から見た図）", hx + 8 * d, hy - L * 0.55 + 18 * d);
 
-  const shake = (fw.buzz || 0) * 6 * d;
+  // The buzz is 40 Hz but the screen redraws at 60 Hz, so drawing the real wobble aliases
+  // into a slow sway. Flip sides every frame instead: it reads as a fast shiver.
+  buzzFlip = -buzzFlip;
+  const shake = fw.buzzLeft > 0 ? clamp(P.buzzamp, 0, 1) * 7 * d * buzzFlip : 0;
   const th = phys.theta;
   const ex = hx + Math.cos(th) * L, ey = hy + Math.sin(th) * L;
   const nx = -Math.sin(th), ny = Math.cos(th);
-  const sx = nx * shake * Math.sin(phys.t), sy = ny * shake * Math.sin(phys.t);
+  const sx = nx * shake, sy = ny * shake;
 
   // motor and string
   sctx.fillStyle = css("--motor");
@@ -404,15 +424,22 @@ function drawScene() {
   }
   // resisting force arrow at the handle
   const fm = -phys.tauMotor / G.W;
-  if (fm > 0.05) {
+  if (fw.state === "RESIST" && fm > 0.05) {
     const len = Math.min(fm * 6, 120) * d;
     const tx = -nx, ty = -ny;   // toward closing
     sctx.strokeStyle = css("--string"); sctx.lineWidth = 3 * d;
     sctx.beginPath(); sctx.moveTo(ex, ey); sctx.lineTo(ex + tx * len, ey + ty * len); sctx.stroke();
+    sctx.fillStyle = css("--string"); sctx.fillText("開けるのに逆らう力", ex + tx * len + 6 * d, ey + ty * len);
   }
-  if (fw.buzz > 0) { sctx.fillStyle = css("--warn"); sctx.fillText("ブルッ", ex + 12 * d, ey + 20 * d); }
+  if (fw.buzzLeft > 0) { sctx.fillStyle = css("--warn"); sctx.fillText("ブルッ", ex + 12 * d, ey + 20 * d); }
   sctx.fillStyle = css("--muted");
   sctx.fillText("取っ手をドラッグして開ける", 12 * d, h - 12 * d);
+  if (phys.selfClosing) {
+    sctx.fillStyle = css("--ok");
+    sctx.fillText("1分たったので、扉が自然に閉まっています（モーターではありません）", 12 * d, h - 32 * d);
+  } else if (phys.theta > 0.02 && phys.aloneMs > 0) {
+    sctx.fillText(`あと ${Math.ceil((SELF_CLOSE_MS - phys.aloneMs) / 1000)} 秒で扉が自然に閉まります`, 12 * d, h - 32 * d);
+  }
 }
 function drawPlot() {
   const { w, h, d } = fitCanvas(plot);
