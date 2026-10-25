@@ -11,6 +11,7 @@ mounts/*.json の設定・開閉ログ・再接続を受け持つ。
     python fridge.py add "レポートを出す"   # タスクを追加（重みを推定する）
     python fridge.py reset                 # 全部未完了に戻す（翌日の朝など）
     python fridge.py weights               # いまの重みを表示
+    python fridge.py estimate              # 今あるタスクで重みが無いものを推定（本番前に1回）
 
     ./run-string.sh                        # 窓1: ボードにつなぐ（先に起動しておく）
     python fridge.py run                   # 窓2: tasks.json を見て level を control.json に書く
@@ -40,6 +41,7 @@ API キーは環境変数 ANTHROPIC_API_KEY から読む。コードには書か
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -120,9 +122,13 @@ def estimate_weight(text):
         "数値だけを返してください。説明は不要です。\n\n"
         f"タスク: {text}"
     )
+    # Haiku 5.5 は既定で考えてから答えるので、応答の先頭が thinking ブロックになることがあり、
+    # 考えた分も max_tokens に数えられる。16 だと答えの前に打ち切られるので余裕を持たせ、
+    # effort を low にして考える量を減らす。
     body = json.dumps({
         "model": API_MODEL,
-        "max_tokens": 16,
+        "max_tokens": 1024,
+        "output_config": {"effort": "low"},
         "messages": [{"role": "user", "content": prompt}],
     }).encode("utf-8")
 
@@ -135,8 +141,9 @@ def estimate_weight(text):
     try:
         with urllib.request.urlopen(req, timeout=API_TIMEOUT) as res:
             data = json.load(res)
-        answer = data["content"][0]["text"].strip()
-        value = float(answer)
+        # 先頭は thinking のことがあるので、text ブロックだけを見る。「0.7です」のような答えにも備える
+        answer = "".join(b["text"] for b in data["content"] if b.get("type") == "text")
+        value = float(re.search(r"\d+(?:\.\d+)?", answer).group())
         return min(max(value, 0.0), 1.0)
     except Exception as e:
         # 通信・認証・形式、どれで失敗しても推定なしにするだけ。
@@ -240,6 +247,25 @@ def cmd_reset(args):
     show(tasks)
 
 
+def cmd_estimate(args):
+    """今あるタスクのうち重みがまだ無いものを推定して weights.json に入れる。
+
+    デモの前に1回だけ実行して重みを確定させる（本番中は add しない）。
+    """
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        sys.exit("ANTHROPIC_API_KEY が設定されていません")
+    tasks = load_tasks()
+    weights = load_weights()
+    for t in tasks:
+        if t["text"] in weights:
+            continue
+        w = estimate_weight(t["text"])
+        if w is not None:
+            weights[t["text"]] = round(w, 2)
+            save_weights(weights)
+    show(tasks)
+
+
 def cmd_weights(args):
     weights = load_weights()
     if not weights:
@@ -299,6 +325,7 @@ def main():
     sub.add_parser("list").set_defaults(func=cmd_list)
     sub.add_parser("reset").set_defaults(func=cmd_reset)
     sub.add_parser("weights").set_defaults(func=cmd_weights)
+    sub.add_parser("estimate").set_defaults(func=cmd_estimate)
 
     d = sub.add_parser("done")
     d.add_argument("index", type=int)
