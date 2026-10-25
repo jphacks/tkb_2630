@@ -98,6 +98,11 @@ typedef struct
      * while resisting before we treat it as let go. A single count would chatter
      * whenever the motor slightly outpulls the hand. */
     volatile int32_t release_counts;
+
+    /* Written by the host: how long the shaft must sit short of the closed point before
+     * the wind-back pulls harder. Too short and a lid let go while open is pulled shut
+     * at once; 0 = DOOR_WIND_STILL_MS. */
+    volatile uint32_t wind_wait_ms;
 } DOOR_t;
 
 extern DOOR_t door;

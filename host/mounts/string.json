@@ -20,7 +20,8 @@
     "relent": 4000,
     "floor": 0.0,
     "recover": 1500,
-    "release": 3
+    "release": 3,
+    "windwait": 2000
   },
   "profiles": {
     "day": {"level": 0.4, "max": 1.5, "damp": 0.0, "buzzlevel": 1.1},

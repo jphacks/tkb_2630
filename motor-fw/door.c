@@ -88,6 +88,7 @@ DOOR_t door =
     .recover_ms = 1500U,
     .strength = 1.0f,
     .release_counts = 3,
+    .wind_wait_ms = 2000U,
 };
 
 /* Hall code (u | v << 1 | w << 2) -> sector 0..5 along the DB42M03 sequence.
@@ -303,7 +304,8 @@ static float WindBack(uint32_t now_ms)
         return 0.0f;
     }
 
-    if (((now_ms - last_count_ms) > DOOR_WIND_STILL_MS) && ((int32_t)(now_ms - wind_next_ms) >= 0))
+    uint32_t wait_ms = (door.wind_wait_ms > 0U) ? MIN(door.wind_wait_ms, 60000U) : DOOR_WIND_STILL_MS;
+    if (((now_ms - last_count_ms) > wait_ms) && ((int32_t)(now_ms - wind_next_ms) >= 0))
     {
         wind_kick_ms = now_ms;
         wind_kick_best = wind_best;

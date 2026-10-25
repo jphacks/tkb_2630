@@ -94,9 +94,10 @@ class Door:
     recover_ms: int
     strength: float
     release_counts: int
+    wind_wait_ms: int
 
 
-FORMAT = "<IIfffiiIifIIIffffIIIiiii" "fffIIfi" "fIIIfffiII" "IIf" "IIfIf" "i"
+FORMAT = "<IIfffiiIifIIIffffIIIiiii" "fffIIfi" "fIIIfffiII" "IIf" "IIfIf" "i" "I"
 
 # Bit order of FAULT_FLAGS_t.sw in motor-ctrl-lib (CTRL_METHOD_RFO)
 FAULT_NAMES = ["oc", "ot_ps", "ov_vdc", "uv_vdc", "os", "hall", "params", "brk", "em_stop",
@@ -267,6 +268,7 @@ SETTINGS = {
     "floor": ("relent_floor", 1.0, False),
     "recover": ("recover_ms", 20000, True),
     "release": ("release_counts", 240, True),  # move back this far while resisting = let go
+    "windwait": ("wind_wait_ms", 60000, True),  # stopped short of closed this long: pull harder
 }
 
 
@@ -291,7 +293,8 @@ MOUNTS = load_mounts()
 
 HELP = ("type 0-1 for a level; 'max 2', 'take 0.3', 'free 36', 'ramp 24', 'damp 0.01', "
         "'buzzamp 0.6', 'buzzhz 40', 'buzzms 200', 'buzzlevel 0.5', 'full 72', 'window 120', "
-        "'hold 1', 'closecps 60', 'relentdelay 1000', 'relent 2000', 'floor 0', 'recover 1500', 'release 3'; "
+        "'hold 1', 'closecps 60', 'relentdelay 1000', 'relent 2000', 'floor 0', 'recover 1500', 'release 3', "
+        "'windwait 2000'; "
         "'buzz' to buzz now; 'profile day|night|off'; q to stop")
 
 
