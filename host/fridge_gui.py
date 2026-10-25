@@ -3,8 +3,10 @@
 fridge.py と同じ tasks.json を読み書きするので、
 CLI (python fridge.py done 0) と併用しても食い違わない。
 
-    ./run-string.sh          # 窓1: ボードにつなぐ（先に起動しておく）
-    python fridge_gui.py     # 窓2: level を control.json に書く
+    ./run-string.sh                                      # 窓1: ボードにつなぐ（先に起動しておく）
+    uv run --python 3.11 --with pyserial fridge_gui.py   # 窓2: level を control.json に書く
+
+macOS 付属の Python 3.9（Tk 8.5）では画面が描かれないので、Tk 8.6 の入った 3.11 で動かす。
 
 ボードと話すのは run-string.sh だけ。GUI は J-Link に触らないので、
 run-string.sh が無くても画面だけ動く。
@@ -13,9 +15,14 @@ run-string.sh は自分が起動する前の control.json を無視するので�
 E84 AI Kit がつながっていれば、レーダーで「お願い」（手を合わせて前に突き出す =
 Push）を見張る。お願いされたら、次に1回開け切るまで（GRANT_S 秒で打ち切り）
 level 0 にして扉を軽くする。E84 が無ければ今までどおり動く。
+
+開け切るたびに「食べてどうだった？」と聞き、答えを reflect.py で記録する。
+「学習して重さを調整する」がオンなら、時間帯ごとの最近の答えから最大の力を変える
+（後悔が多ければ強く、満足が多ければ弱く）。段階（level）の決まり方は変えない。
 """
 
 import csv
+import json
 import os
 import queue
 import threading
@@ -23,7 +30,8 @@ import time
 import tkinter as tk
 from tkinter import font as tkfont
 
-import fridge  # load_tasks / save_tasks / level_for / write_control を借りる
+import fridge  # load_tasks / save_tasks / level_for を借りる
+import reflect  # 気持ちの記録と、次の重さへの返し方
 
 try:
     import gesture  # pyserial が要るので、無い環境ではお願い無しで動く
@@ -46,21 +54,31 @@ STAGES = [
     ("#ef4444", "両手が要る"),         # level 1.0
 ]
 
-WINDOW = "520x460"
+WINDOW = "520x600"
 POLL_MS = 400           # tasks.json を見に行く間隔
 
 GRANT_COLOR = "#60a5fa"  # お願いを聞いているあいだの文字色
 GRANT_S = 30            # お願いしてもこの秒数のうちに開けなければ、元の重さに戻す
+ASK_S = 60              # 「食べてどうだった？」をこの秒数で引っ込める（答えなければ記録しない）
+NOTE_S = 4              # 「我慢できた」の表示を出しておく秒数
 EVENTS_PATH = os.path.join(fridge.HERE, "logs", "events.csv")  # run-string.sh が開閉ごとに書く
 
 
-def full_openings():
-    """run-string.sh が記録した「開け切った」回数（events.csv の gave_up が 0 の行）。"""
+def read_events():
+    """run-string.sh が記録した開閉（events.csv）。gave_up が 0 なら開け切った、1 なら途中でやめた。"""
     try:
         with open(EVENTS_PATH, newline="") as f:
-            return sum(1 for row in csv.DictReader(f) if row.get("gave_up") == "0")
+            return [row for row in csv.DictReader(f) if row.get("gave_up") in ("0", "1")]
     except OSError:
-        return 0
+        return []
+
+
+def write_control(level, max_a):
+    """control.json に level と最大電流を書く。書きかけを読まれないよう tmp から差し替える。"""
+    tmp = fridge.CONTROL_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"level": level, "max": round(max_a, 2)}, f)
+    os.replace(tmp, fridge.CONTROL_PATH)
 
 
 def watch_gestures(events):
@@ -84,11 +102,16 @@ def watch_gestures(events):
 class FridgeGUI:
     def __init__(self, root):
         self.root = root
-        self.last_level = None
+        self.last_sent = None  # 最後に control.json に書いた (level, 最大電流)
         self.vars = []      # チェックボックスの状態
         self.granted = False  # お願いを聞いて、1回だけ軽くしているところ
         self.grant_until = 0.0
         self.grant_seen = 0   # お願いされた時点の「開け切った」回数
+        self.events_seen = len(read_events())  # 起動前の開閉は聞かない
+        self.asking = None    # 「食べてどうだった？」を聞いている開閉の記録
+        self.ask_until = 0.0
+        self.note_until = 0.0
+        self.feelings = reflect.load()
         self.gestures = queue.Queue()
         if gesture:
             threading.Thread(target=watch_gestures, args=(self.gestures,), daemon=True).start()
@@ -141,10 +164,28 @@ class FridgeGUI:
         self.label_level = tk.Label(self.root, font=self.f_level, bg=BG, fg=SUB)
         self.label_level.pack()
 
+        # 学習：最近の気持ちから最大の力をどう変えているか
+        self.label_learn = tk.Label(self.root, font=self.f_level, bg=BG, fg=SUB, wraplength=460)
+        self.label_learn.pack(pady=(14, 0))
+
+        # 開け切ったあとに出す「食べてどうだった？」。ふだんは隠しておく
+        self.frame_ask = tk.Frame(self.root, bg=BG)
+        tk.Label(self.frame_ask, text="食べてどうだった？", font=self.f_task, bg=BG, fg=FG).pack(side="left")
+        for answer in reflect.ANSWERS:
+            tk.Button(self.frame_ask, text=answer, font=self.f_count,
+                      command=lambda a=answer: self.answer(a)).pack(side="left", padx=4)
+
         self.label_link = tk.Label(self.root, font=self.f_level, bg=BG, fg=SUB)
         self.label_link.pack(side="bottom", pady=10)
         self.label_link.config(text="ドアへは ./run-string.sh が送る"
                                + ("  /  E84 でお願いを見張り中" if gesture else ""))
+
+        # 本番で動きを固定したいときは、学習をオフにする
+        self.adapt = tk.BooleanVar(value=True)
+        tk.Checkbutton(self.root, text="気持ちから学んで重さを調整する", variable=self.adapt,
+                       command=self.refresh, font=self.f_level, bg=BG, fg=SUB, selectcolor=BG,
+                       activebackground=BG, activeforeground=FG, bd=0,
+                       highlightthickness=0).pack(side="bottom")
 
         self.canvas.bind("<Configure>", lambda e: self.draw_bar())
 
@@ -162,21 +203,57 @@ class FridgeGUI:
             if var.get() != t["done"]:
                 var.set(t["done"])
 
+        # run-string.sh が新しく記録した開閉：開け切ったら気持ちを聞き、途中でやめたら「我慢」
+        events = read_events()
+        for event in events[self.events_seen:]:
+            self.on_event(event, tasks)
+        self.events_seen = len(events)
+        full = sum(1 for e in events if e["gave_up"] == "0")
+        if self.asking and time.time() > self.ask_until:
+            self.hide_ask()
+
         # お願い（Push）されたら、次に1回開け切るまで軽くする。もう軽いときは何もしない
         while not self.gestures.empty():
             self.gestures.get()
             if not self.granted and fridge.level_for(tasks) > 0:
                 self.granted = True
                 self.grant_until = time.time() + GRANT_S
-                self.grant_seen = full_openings()
+                self.grant_seen = full
                 print(f"\n=== お願いを聞いた: 次の1回だけ軽くする（{GRANT_S} 秒以内）===\n", flush=True)
-        if self.granted and (full_openings() > self.grant_seen or time.time() > self.grant_until):
+        if self.granted and (full > self.grant_seen or time.time() > self.grant_until):
             self.granted = False
-            why = "開け切った" if full_openings() > self.grant_seen else "時間切れ"
+            why = "開け切った" if full > self.grant_seen else "時間切れ"
             print(f"\n=== 元の重さに戻した（{why}）===\n", flush=True)
 
         self.refresh()
         self.root.after(POLL_MS, self.poll)
+
+    def on_event(self, event, tasks):
+        if event["gave_up"] == "0":
+            self.asking = event
+            self.ask_until = time.time() + ASK_S
+            self.frame_ask.pack(pady=(14, 0))
+        elif int(event.get("max_dist") or 0) >= reflect.HELD_BACK_MIN_COUNTS:
+            self.save_feeling(reflect.HELD_BACK, event, tasks)
+            self.note_until = time.time() + NOTE_S
+
+    def answer(self, feeling):
+        if self.asking:
+            self.save_feeling(feeling, self.asking, fridge.load_tasks())
+        self.hide_ask()
+        self.refresh()
+
+    def hide_ask(self):
+        self.asking = None
+        self.frame_ask.pack_forget()
+
+    def save_feeling(self, feeling, event, tasks):
+        level = float(event.get("level") or 0)
+        max_a = float(event.get("max") or reflect.base_max())
+        remaining = sum(1 for t in tasks if not t["done"])
+        reflect.record(feeling, event, level, max_a, remaining)
+        self.feelings = reflect.load()
+        print(f"=== 記録: {feeling}（引いた力 {event.get('energy_mj', '?')} mJ）===", flush=True)
 
     def refresh(self):
         tasks = fridge.load_tasks()
@@ -188,17 +265,26 @@ class FridgeGUI:
             level, name, color = 0.0, "今回だけだよ", GRANT_COLOR
             note = f"（お願いを聞いて1回だけ開く・あと {max(0, int(self.grant_until - time.time()))} 秒）"
 
+        if self.adapt.get():
+            max_a, why = reflect.max_for(self.feelings)
+        else:
+            max_a, why = reflect.base_max(), "学習はオフ（いつもの重さ）"
+        if time.time() < self.note_until:
+            why = "途中でやめた：我慢できた！として記録しました"
+
         self.label_count.config(text=f"{done} / {len(tasks)} 完了")
         self.label_state.config(text=name, fg=color)
-        self.label_level.config(text=f"level {level:.2f}{note}")
+        self.label_level.config(text=f"level {level:.2f}  最大 {max_a:.1f} A{note}")
+        self.label_learn.config(text=why)
         self.ratio = done / len(tasks) if tasks else 0
         self.bar_color = color
         self.draw_bar()
 
-        # level が変わったときだけ control.json に書く（run-string.sh がドアに送る）
-        if level != self.last_level:
-            fridge.write_control(level)
-            self.last_level = level
+        # 変わったときだけ control.json に書く（run-string.sh がドアに送る）
+        sent = (level, round(max_a, 2))
+        if sent != self.last_sent:
+            write_control(*sent)
+            self.last_sent = sent
 
     def draw_bar(self):
         w = self.canvas.winfo_width()
