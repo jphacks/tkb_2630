@@ -5,10 +5,10 @@
   "settings": {
     "take": 0.2,
     "max": 2.0,
-    "free": 36,
-    "ramp": 24,
+    "free": 18,
+    "ramp": 12,
     "damp": 0.005,
-    "full": 72,
+    "full": 36,
     "window": 120,
     "hold": 0,
     "closecps": 60,
