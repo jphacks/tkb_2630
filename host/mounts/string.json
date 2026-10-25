@@ -5,7 +5,7 @@
   "settings": {
     "take": 0.2,
     "max": 2.0,
-    "free": 18,
+    "free": 0,
     "ramp": 12,
     "damp": 0.005,
     "full": 36,
