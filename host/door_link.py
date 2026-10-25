@@ -30,6 +30,10 @@ DEFAULT_ELF = os.path.join(
 )
 NM = os.path.expanduser("~/Applications/mtb-gcc-arm-eabi/14.2.1/gcc/bin/arm-none-eabi-nm")
 JLINK_DEVICE = "PSC3xxF"  # attach without reset; the _tm variant resets into test mode
+# The motor kit's on-board J-Link, picked by serial number: the magnetic sensor kit has the
+# same "J-Link Lite-XMC4200", so with both plugged in the first one found may be the wrong
+# board. Set DOOR_JLINK_SERIAL for another kit; set it empty to take whichever J-Link is there.
+JLINK_SERIAL = os.environ.get("DOOR_JLINK_SERIAL", "591234791")
 CONTROL_FILE = os.path.join(HERE, "control.json")  # e.g. {"level": 0.5}; read by `run` when it changes
 LOG_DIR = os.path.join(HERE, "logs")
 MOUNT_DIR = os.path.join(HERE, "mounts")
@@ -127,7 +131,7 @@ class DoorLink:
         self._attach()
 
     def _attach(self):
-        self.jlink.open()
+        self.jlink.open(serial_no=int(JLINK_SERIAL) if JLINK_SERIAL else None)
         self.jlink.set_tif(pylink.enums.JLinkInterfaces.SWD)
         self.jlink.connect(JLINK_DEVICE, speed=4000)
 
