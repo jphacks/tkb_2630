@@ -17,7 +17,7 @@
     "buzzms": 200,
     "buzzlevel": 0.5,
     "relentdelay": 1000,
-    "relent": 2000,
+    "relent": 4000,
     "floor": 0.0,
     "recover": 1500,
     "release": 3
