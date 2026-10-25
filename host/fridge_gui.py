@@ -3,17 +3,18 @@
 fridge.py と同じ tasks.json を読み書きするので、
 CLI (python fridge.py done 0) と併用しても食い違わない。
 
-    python fridge_gui.py                 # ハードなし。表示だけ
-    python fridge_gui.py --open-dir -1   # ドアに繋ぐ
+    ./run-string.sh          # 窓1: ボードにつなぐ（先に起動しておく）
+    python fridge_gui.py     # 窓2: level を control.json に書く
 
-ハードに繋がらなくても起動する。繋がっていなければ画面だけ動く。
+ボードと話すのは run-string.sh だけ。GUI は J-Link に触らないので、
+run-string.sh が無くても画面だけ動く。
+run-string.sh は自分が起動する前の control.json を無視するので、起動は窓1 → 窓2 の順。
 """
 
-import argparse
 import tkinter as tk
 from tkinter import font as tkfont
 
-import fridge  # load_tasks / save_tasks / level_for / LEVELS を借りる
+import fridge  # load_tasks / save_tasks / level_for / write_control を借りる
 
 # --- 見た目の設定。色を変えたいときはここだけ ---
 
@@ -36,9 +37,8 @@ POLL_MS = 400           # tasks.json を見に行く間隔
 
 
 class FridgeGUI:
-    def __init__(self, root, link=None):
+    def __init__(self, root):
         self.root = root
-        self.link = link
         self.last_level = None
         self.vars = []      # チェックボックスの状態
 
@@ -92,9 +92,7 @@ class FridgeGUI:
 
         self.label_link = tk.Label(self.root, font=self.f_level, bg=BG, fg=SUB)
         self.label_link.pack(side="bottom", pady=10)
-        self.label_link.config(
-            text="ドアに接続中" if self.link else "表示のみ（ドア未接続）"
-        )
+        self.label_link.config(text="ドアへは ./run-string.sh が送る")
 
         self.canvas.bind("<Configure>", lambda e: self.draw_bar())
 
@@ -128,10 +126,9 @@ class FridgeGUI:
         self.bar_color = color
         self.draw_bar()
 
-        # level が変わったときだけドアに送る
+        # level が変わったときだけ control.json に書く（run-string.sh がドアに送る）
         if level != self.last_level:
-            if self.link:
-                self.link.write(level=level)
+            fridge.write_control(level)
             self.last_level = level
 
     def draw_bar(self):
@@ -142,32 +139,10 @@ class FridgeGUI:
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--open-dir", type=int, choices=(-1, 1),
-                   help="指定するとドアに接続する。calibrate で調べた値")
-    p.add_argument("--wind-sign", type=int, choices=(-1, 1), default=1)
-    p.add_argument("--i-take", type=float, default=0.2)
-    p.add_argument("--i-max", type=float, default=1.0)
-    args = p.parse_args()
-
-    link = None
-    if args.open_dir is not None:
-        from door_link import DoorLink
-
-        link = DoorLink()
-        link.write(armed=0, level=0.0, i_take=args.i_take,
-                   i_resist_max=args.i_max, open_dir=args.open_dir,
-                   wind_sign=args.wind_sign)
-        link.start_heartbeat()
-        link.write(armed=1)
-
+    # 電流・向き・距離は mounts/*.json に一本化したので、ここでは持たない
     root = tk.Tk()
-    FridgeGUI(root, link)
-    try:
-        root.mainloop()
-    finally:
-        if link:
-            link.close()
+    FridgeGUI(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":

@@ -119,7 +119,7 @@ def cmd_reset(args):
 
 # --- ドアに level を渡すコマンド ---
 
-def write_level(level):
+def write_control(level):
     """control.json に {"level": X} を書く。
 
     run は mtime の変化で読み直すので、書きかけを読まれると JSON が壊れる。
@@ -150,7 +150,7 @@ def cmd_run(args):
             if level != last:
                 print(f"level -> {level:.2f}  ({describe(level)})")
                 if not args.dry_run:
-                    write_level(level)
+                    write_control(level)
                 last = level
             time.sleep(0.5)
     except KeyboardInterrupt:
