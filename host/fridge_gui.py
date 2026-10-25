@@ -136,7 +136,7 @@ class FridgeGUI:
         if gesture:
             threading.Thread(target=watch_gestures, args=(self.gestures,), daemon=True).start()
 
-        root.title("おあずけ冷蔵庫")
+        root.title("オモイゾウコ")
         root.configure(bg=BG)
         root.geometry(WINDOW)
 
