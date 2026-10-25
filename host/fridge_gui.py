@@ -14,7 +14,8 @@ run-string.sh は自分が起動する前の control.json を無視するので�
 
 E84 AI Kit がつながっていれば、レーダーで「お願い」（手を合わせて前に突き出す =
 Push）を見張る。お願いされたら、次に1回開け切るまで（GRANT_S 秒で打ち切り）
-level 0 にして扉を軽くする。E84 が無ければ今までどおり動く。
+level 0 にして扉を軽くする。聞くのは3時間に1回まで（GUI で Ctrl+R を押すと数え直し）。
+E84 が無ければ今までどおり動く。
 
 開け切るたびに「食べてどうだった？」と聞き、答えを reflect.py で記録する。
 「学習して重さを調整する」がオンなら、時間帯ごとの最近の答えから最大の力を変える
@@ -59,6 +60,9 @@ POLL_MS = 400           # tasks.json を見に行く間隔
 
 GRANT_COLOR = "#60a5fa"  # お願いを聞いているあいだの文字色
 GRANT_S = 30            # お願いしてもこの秒数のうちに開けなければ、元の重さに戻す
+GRANT_EVERY_S = 3 * 3600  # お願いを聞くのは3時間に1回まで
+# 最後にお願いを聞いた時刻。GUI を起動し直しても3時間は数え続ける。消せば数え直し
+GRANT_STATE_PATH = os.path.join(fridge.HERE, "logs", "onegai.json")
 ASK_S = 60              # 「食べてどうだった？」をこの秒数で引っ込める（答えなければ記録しない）
 NOTE_S = 4              # 「我慢できた」の表示を出しておく秒数
 EVENTS_PATH = os.path.join(fridge.HERE, "logs", "events.csv")  # run-string.sh が開閉ごとに書く
@@ -71,6 +75,20 @@ def read_events():
             return [row for row in csv.DictReader(f) if row.get("gave_up") in ("0", "1")]
     except OSError:
         return []
+
+
+def load_last_grant():
+    try:
+        with open(GRANT_STATE_PATH, encoding="utf-8") as f:
+            return float(json.load(f)["last"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return 0.0
+
+
+def save_last_grant(t):
+    os.makedirs(os.path.dirname(GRANT_STATE_PATH), exist_ok=True)
+    with open(GRANT_STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump({"last": t, "local_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))}, f)
 
 
 def write_control(level, max_a):
@@ -110,7 +128,9 @@ class FridgeGUI:
         self.events_seen = len(read_events())  # 起動前の開閉は聞かない
         self.asking = None    # 「食べてどうだった？」を聞いている開閉の記録
         self.ask_until = 0.0
-        self.note_until = 0.0
+        self.note_until = 0.0  # 一言（我慢できた／お願いは3時間に1回）を出しておく期限
+        self.note_text = ""
+        self.last_grant = load_last_grant()
         self.feelings = reflect.load()
         self.gestures = queue.Queue()
         if gesture:
@@ -188,6 +208,15 @@ class FridgeGUI:
                        highlightthickness=0).pack(side="bottom")
 
         self.canvas.bind("<Configure>", lambda e: self.draw_bar())
+        # 本番直前やリハーサルのあとに、3時間の数えをリセットする
+        for key in ("<Control-r>", "<Command-r>"):
+            self.root.bind(key, lambda e: self.reset_grant())
+
+    def reset_grant(self):
+        self.last_grant = 0.0
+        save_last_grant(0.0)
+        self.note("お願いの3時間をリセットしました")
+        print("\n=== お願いの3時間をリセット ===\n", flush=True)
 
     def toggle(self, index):
         """チェックが変わったら tasks.json に書き戻す。"""
@@ -212,14 +241,24 @@ class FridgeGUI:
         if self.asking and time.time() > self.ask_until:
             self.hide_ask()
 
-        # お願い（Push）されたら、次に1回開け切るまで軽くする。もう軽いときは何もしない
+        # お願い（Push）されたら、次に1回開け切るまで軽くする。もう軽いときは何もしない。
+        # 聞くのは3時間に1回まで。それより早いお願いは断って、あとどれくらいかを出す
         while not self.gestures.empty():
             self.gestures.get()
-            if not self.granted and fridge.level_for(tasks) > 0:
-                self.granted = True
-                self.grant_until = time.time() + GRANT_S
-                self.grant_seen = full
-                print(f"\n=== お願いを聞いた: 次の1回だけ軽くする（{GRANT_S} 秒以内）===\n", flush=True)
+            if self.granted or fridge.level_for(tasks) == 0:
+                continue
+            wait = self.last_grant + GRANT_EVERY_S - time.time()
+            if wait > 0:
+                h, m = divmod(int(wait // 60), 60)
+                self.note(f"お願いは3時間に1回まで（あと{h}時間{m}分）")
+                print(f"\n=== お願いを断った: 3時間に1回まで（あと {h}:{m:02d}）===\n", flush=True)
+                continue
+            self.granted = True
+            self.grant_until = time.time() + GRANT_S
+            self.grant_seen = full
+            self.last_grant = time.time()
+            save_last_grant(self.last_grant)
+            print(f"\n=== お願いを聞いた: 次の1回だけ軽くする（{GRANT_S} 秒以内）===\n", flush=True)
         if self.granted and (full > self.grant_seen or time.time() > self.grant_until):
             self.granted = False
             why = "開け切った" if full > self.grant_seen else "時間切れ"
@@ -235,7 +274,12 @@ class FridgeGUI:
             self.frame_ask.pack(pady=(14, 0))
         elif int(event.get("max_dist") or 0) >= reflect.HELD_BACK_MIN_COUNTS:
             self.save_feeling(reflect.HELD_BACK, event, tasks)
-            self.note_until = time.time() + NOTE_S
+            self.note("途中でやめた：我慢できた！として記録しました")
+
+    def note(self, text):
+        """学習の理由の欄に、NOTE_S 秒だけ一言を出す。"""
+        self.note_text = text
+        self.note_until = time.time() + NOTE_S
 
     def answer(self, feeling):
         if self.asking:
@@ -270,7 +314,7 @@ class FridgeGUI:
         else:
             max_a, why = reflect.base_max(), "学習はオフ（いつもの重さ）"
         if time.time() < self.note_until:
-            why = "途中でやめた：我慢できた！として記録しました"
+            why = self.note_text
 
         self.label_count.config(text=f"{done} / {len(tasks)} 完了")
         self.label_state.config(text=name, fg=color)
