@@ -1,0 +1,14 @@
+[Device=PSE846GPS2DBZC4A]
+
+# The "reserved resources" feature is used to ensure that the device configurator reserves the listed memory regions for default use.
+# These regions are not accessible for user code in default use cases.
+#
+# NOTE: The device above is intentionally a single, specific MPN - the regions below are only valid for it.
+# RRAM size varies per MPN, so a region listed here may exceed the memory actually available on another MPN.
+# When targeting a different MPN, the Device Configurator reports a mismatch warning; this is intended.
+# Update the device and verify the offsets/sizes against that MPN's memory map rather than suppressing the warning.
+
+[MemoryRegions]
+GUID=extended_boot_reserved ID=extended_boot_reserved MEMORY=RRAM OFFSET=0x00000000 SIZE=0x00011000 PROTECTION=kTqxq_31FkI REQUIRED_CAPABILITIES=NONVOLATILE
+GUID=reserved_region ID=reserved_region MEMORY=RRAM OFFSET=0x0006A000 SIZE=0x00016000 PROTECTION=kTqxq_31FkI REQUIRED_CAPABILITIES=NONVOLATILE
+GUID=extended_boot_sram_reserved ID=extended_boot_sram_reserved MEMORY=SRAM OFFSET=0x00000000 SIZE=0x0001000 PROTECTION=kTqxq_31FkI REQUIRED_CAPABILITIES=

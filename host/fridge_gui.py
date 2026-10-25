@@ -9,12 +9,26 @@ CLI (python fridge.py done 0) と併用しても食い違わない。
 ボードと話すのは run-string.sh だけ。GUI は J-Link に触らないので、
 run-string.sh が無くても画面だけ動く。
 run-string.sh は自分が起動する前の control.json を無視するので、起動は窓1 → 窓2 の順。
+
+E84 AI Kit がつながっていれば、レーダーで「お願い」（手を合わせて前に突き出す =
+Push）を見張る。お願いされたら、次に1回開け切るまで（GRANT_S 秒で打ち切り）
+level 0 にして扉を軽くする。E84 が無ければ今までどおり動く。
 """
 
+import csv
+import os
+import queue
+import threading
+import time
 import tkinter as tk
 from tkinter import font as tkfont
 
 import fridge  # load_tasks / save_tasks / level_for / write_control を借りる
+
+try:
+    import gesture  # pyserial が要るので、無い環境ではお願い無しで動く
+except ImportError:
+    gesture = None
 
 # --- 見た目の設定。色を変えたいときはここだけ ---
 
@@ -23,17 +37,48 @@ FG = "#e8e8e8"          # 文字
 SUB = "#8a8a8a"         # 薄い文字
 BAR_BG = "#333333"      # バーの地の色
 
-# 未完了の数 -> (バーと文字の色, 重さの呼び名)
-# fridge.LEVELS と添字を揃えてある
+# level -> (バーと文字の色, 重さの呼び名)
+# fridge.LEVELS と添字を揃えてある。重み付きだと「残りの個数」と level がずれるので、level で引く
 STAGES = [
-    ("#4ade80", "いつもどおり開く"),   # 0個 残り = 全部終わった
-    ("#facc15", "少し引っかかる"),     # 1個 残り
-    ("#fb923c", "はっきり重い"),       # 2個 残り
-    ("#ef4444", "両手が要る"),         # 3個以上 残り
+    ("#4ade80", "いつもどおり開く"),   # level 0    = 全部終わった
+    ("#facc15", "少し引っかかる"),     # level 0.25
+    ("#fb923c", "はっきり重い"),       # level 0.5
+    ("#ef4444", "両手が要る"),         # level 1.0
 ]
 
 WINDOW = "520x460"
 POLL_MS = 400           # tasks.json を見に行く間隔
+
+GRANT_COLOR = "#60a5fa"  # お願いを聞いているあいだの文字色
+GRANT_S = 30            # お願いしてもこの秒数のうちに開けなければ、元の重さに戻す
+EVENTS_PATH = os.path.join(fridge.HERE, "logs", "events.csv")  # run-string.sh が開閉ごとに書く
+
+
+def full_openings():
+    """run-string.sh が記録した「開け切った」回数（events.csv の gave_up が 0 の行）。"""
+    try:
+        with open(EVENTS_PATH, newline="") as f:
+            return sum(1 for row in csv.DictReader(f) if row.get("gave_up") == "0")
+    except OSError:
+        return 0
+
+
+def watch_gestures(events):
+    """E84 のレーダーで Push を見張り、見つけたら events に積む。抜き差しされても待ち直す。
+    認識の様子はこの窓のターミナルに流す（gesture.py watch と同じ表示）。"""
+    while True:
+        port = gesture.find_port()
+        if port:
+            try:
+                det = gesture.Detector()
+                for scores in gesture.frames(port):
+                    found = det.feed(scores)
+                    print(gesture.describe(scores, found), flush=True)
+                    if found == "Push":
+                        events.put("Push")
+            except (gesture.serial.SerialException, OSError):
+                pass
+        time.sleep(2)
 
 
 class FridgeGUI:
@@ -41,6 +86,12 @@ class FridgeGUI:
         self.root = root
         self.last_level = None
         self.vars = []      # チェックボックスの状態
+        self.granted = False  # お願いを聞いて、1回だけ軽くしているところ
+        self.grant_until = 0.0
+        self.grant_seen = 0   # お願いされた時点の「開け切った」回数
+        self.gestures = queue.Queue()
+        if gesture:
+            threading.Thread(target=watch_gestures, args=(self.gestures,), daemon=True).start()
 
         root.title("おあずけ冷蔵庫")
         root.configure(bg=BG)
@@ -92,7 +143,8 @@ class FridgeGUI:
 
         self.label_link = tk.Label(self.root, font=self.f_level, bg=BG, fg=SUB)
         self.label_link.pack(side="bottom", pady=10)
-        self.label_link.config(text="ドアへは ./run-string.sh が送る")
+        self.label_link.config(text="ドアへは ./run-string.sh が送る"
+                               + ("  /  E84 でお願いを見張り中" if gesture else ""))
 
         self.canvas.bind("<Configure>", lambda e: self.draw_bar())
 
@@ -109,19 +161,36 @@ class FridgeGUI:
         for var, t in zip(self.vars, tasks):
             if var.get() != t["done"]:
                 var.set(t["done"])
+
+        # お願い（Push）されたら、次に1回開け切るまで軽くする。もう軽いときは何もしない
+        while not self.gestures.empty():
+            self.gestures.get()
+            if not self.granted and fridge.level_for(tasks) > 0:
+                self.granted = True
+                self.grant_until = time.time() + GRANT_S
+                self.grant_seen = full_openings()
+                print(f"\n=== お願いを聞いた: 次の1回だけ軽くする（{GRANT_S} 秒以内）===\n", flush=True)
+        if self.granted and (full_openings() > self.grant_seen or time.time() > self.grant_until):
+            self.granted = False
+            why = "開け切った" if full_openings() > self.grant_seen else "時間切れ"
+            print(f"\n=== 元の重さに戻した（{why}）===\n", flush=True)
+
         self.refresh()
         self.root.after(POLL_MS, self.poll)
 
     def refresh(self):
         tasks = fridge.load_tasks()
         done = sum(1 for t in tasks if t["done"])
-        remaining = len(tasks) - done
         level = fridge.level_for(tasks)
-        color, name = STAGES[min(remaining, len(STAGES) - 1)]
+        color, name = STAGES[fridge.LEVELS.index(level)]
+        note = ""
+        if self.granted:
+            level, name, color = 0.0, "今回だけだよ", GRANT_COLOR
+            note = f"（お願いを聞いて1回だけ開く・あと {max(0, int(self.grant_until - time.time()))} 秒）"
 
         self.label_count.config(text=f"{done} / {len(tasks)} 完了")
         self.label_state.config(text=name, fg=color)
-        self.label_level.config(text=f"level {level:.2f}")
+        self.label_level.config(text=f"level {level:.2f}{note}")
         self.ratio = done / len(tasks) if tasks else 0
         self.bar_color = color
         self.draw_bar()
