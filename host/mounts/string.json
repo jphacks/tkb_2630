@@ -3,7 +3,7 @@
   "open_dir": 1,
   "wind_sign": 1,
   "settings": {
-    "take": 0.2,
+    "take": 0.15,
     "max": 2.0,
     "free": 0,
     "ramp": 12,
