@@ -1,4 +1,4 @@
-# おあずけ冷蔵庫（製品名は仮）
+# オモイゾウコ
 
 <!-- Hack Day の動画が撮れたら、下のリンクをその動画に差し替える -->
 [![デモ動画](https://jphacks.com/wp-content/uploads/2026/07/IMG_5316.png)](https://www.youtube.com/watch?v=piaNsc6ilBI)
