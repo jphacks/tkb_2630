@@ -54,6 +54,15 @@
 #define DOOR_HOLD_MAX_MS        (10000U)  /* thermal: stop pushing a door that is kept open */
 #define DOOR_GAVE_IN_STILL_MS   (1500U)   /* after giving in fully, still this long ends resisting */
 #define DOOR_RELENT_PARTIAL_MS  (1500U)   /* extra wait before giving in to a tug that stalls short of full strength */
+#define DOOR_WIND_TOL_COUNTS    (3)       /* this close to the closed point counts as closed */
+#define DOOR_WIND_STILL_MS      (400U)    /* stopped short of the closed point this long: pull briefly harder */
+#define DOOR_WIND_KICK_A        (0.6f)    /* [A] gets a stopped shaft winding again; the take-up alone may not */
+#define DOOR_WIND_KICK_MS       (200U)
+#define DOOR_WIND_PAUSE_MS      (600U)    /* between kicks */
+#define DOOR_WIND_TRIES         (3U)      /* kicks in a row that gain nothing: a hand holds the door, or it is open */
+#define DOOR_WIND_RETRY_MS      (5000U)   /* then wait this long before trying again */
+#define DOOR_WIND_ROUNDS        (3U)      /* rounds that gain nothing: the closed point itself has moved */
+#define DOOR_WIND_SETTLE_MS     (300U)    /* after a kick the string springs back: not an opening */
 
 DOOR_t door =
 {
@@ -118,6 +127,13 @@ static uint32_t hold_start_ms = 0U;
 static uint32_t engaged_ms = 0U; /* time spent resisting someone in the current opening */
 static uint32_t full_ms = 0U;    /* of that, time at full spring strength */
 static int32_t resist_peak = 0;  /* furthest open_dist since resisting began */
+static uint32_t wind_kick_ms = 0U;   /* start of the kick in progress, 0 = none */
+static uint32_t wind_kick_end_ms = 0U;
+static uint32_t wind_next_ms = 0U;   /* earliest time for the next kick */
+static uint32_t wind_tries = 0U;
+static uint32_t wind_rounds = 0U;
+static int32_t wind_best = 0;        /* closest to the closed point since the shaft stopped short of it */
+static int32_t wind_kick_best = 0;   /* wind_best when the kick in progress began */
 
 static uint32_t ReadHall(void)
 {
@@ -170,6 +186,11 @@ static void SetState(DOOR_STATE_t state, uint32_t now_ms)
     {
         door.state = (uint32_t)state;
         state_since_ms = now_ms;
+        /* a new opening or a cool-down starts a new wind-back from scratch */
+        wind_kick_ms = 0U;
+        wind_tries = 0U;
+        wind_rounds = 0U;
+        wind_best = INT32_MAX;
     }
 }
 
@@ -236,6 +257,61 @@ static void TrackOpening(uint32_t now_ms, float iq_abs)
     }
 }
 
+/* Wind the string back to the closed point. A door shut faster than the take-up winds
+ * leaves the string slack, and a stopped shaft can need more than the take-up current
+ * to start turning again. So when the shaft has stopped short of the closed point,
+ * pull briefly harder until it winds again. Kicks that get no closer mean a hand holds
+ * the door, or it is open: wait and try again later, and after a few such rounds take
+ * this position as closed (the string has slipped on the shaft). Returns the extra
+ * current to command, 0 when not kicking. */
+static float WindBack(uint32_t now_ms)
+{
+    if (door.open_dist <= DOOR_WIND_TOL_COUNTS)
+    {
+        wind_kick_ms = 0U;
+        wind_tries = 0U;
+        wind_rounds = 0U;
+        wind_best = door.open_dist;
+        return 0.0f;
+    }
+    wind_best = MIN(wind_best, door.open_dist);
+
+    if (wind_kick_ms != 0U)
+    {
+        bool gained = wind_best <= wind_kick_best - 2;
+        if (!gained && ((now_ms - wind_kick_ms) < DOOR_WIND_KICK_MS))
+        {
+            return DOOR_WIND_KICK_A;
+        }
+        wind_kick_ms = 0U;
+        wind_kick_end_ms = now_ms;
+        wind_next_ms = now_ms + DOOR_WIND_PAUSE_MS;
+        if (gained)
+        {
+            wind_tries = 0U; /* winding again: the take-up carries on from here */
+        }
+        else if (++wind_tries >= DOOR_WIND_TRIES)
+        {
+            wind_tries = 0U;
+            wind_next_ms = now_ms + DOOR_WIND_RETRY_MS;
+            if (++wind_rounds >= DOOR_WIND_ROUNDS)
+            {
+                wind_rounds = 0U;
+                door.home_pos = door.pos;
+            }
+        }
+        return 0.0f;
+    }
+
+    if (((now_ms - last_count_ms) > DOOR_WIND_STILL_MS) && ((int32_t)(now_ms - wind_next_ms) >= 0))
+    {
+        wind_kick_ms = now_ms;
+        wind_kick_best = wind_best;
+        return DOOR_WIND_KICK_A;
+    }
+    return 0.0f;
+}
+
 static void Control(uint32_t now_ms)
 {
     CTRL_VARS_t *vars_ptr = motor[0].vars_ptr;
@@ -261,11 +337,13 @@ static void Control(uint32_t now_ms)
     bool overspeed = ((door.cps * (float)open_dir) < -DOOR_OVERSPEED_CPS) || (fabsf(door.cps) > DOOR_RUNAWAY_CPS);
 
     /* Distance opened, measured from the closed door. Take-up keeps the string wound
-     * while the door is shut, so the most-wound position is "closed"; after a few
-     * seconds at rest, wherever the door sits counts as closed too. */
+     * while the door is shut, so the most-wound position is "closed". A position short
+     * of it is slack string, not a new closed point: WindBack() winds it in. Only small
+     * drift at rest (within DOOR_WIND_TOL_COUNTS) moves the closed point outwards. */
     bool at_rest = (now_ms - last_count_ms) > DOOR_REHOME_MS;
-    if (((door.pos - door.home_pos) * open_dir < 0) || (door.state == DOOR_DISARMED) ||
-        (at_rest && (door.state == DOOR_IDLE)))
+    int32_t dist = (door.pos - door.home_pos) * open_dir;
+    if ((dist < 0) || (door.state == DOOR_DISARMED) ||
+        (at_rest && (door.state == DOOR_IDLE) && (dist <= DOOR_WIND_TOL_COUNTS) && (wind_kick_ms == 0U)))
     {
         door.home_pos = door.pos;
     }
@@ -345,12 +423,13 @@ static void Control(uint32_t now_ms)
         }
         break;
     case DOOR_IDLE:
-        target = i_take + i_hold;
+        target = MAX(i_take + i_hold, WindBack(now_ms));
         if (overspeed)
         {
+            wind_kick_ms = 0U;
             SetState(DOOR_COOLDOWN, now_ms);
         }
-        else if (opening)
+        else if (opening && (wind_kick_ms == 0U) && ((now_ms - wind_kick_end_ms) > DOOR_WIND_SETTLE_MS))
         {
             SetState(DOOR_RESIST, now_ms);
             resist_peak = door.open_dist;
